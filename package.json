@@ -1,0 +1,27 @@
+{
+  "name": "mocktrading",
+  "version": "1.0.0",
+  "description": "模拟交易",
+  "main": "index.js",
+  "scripts": {
+    "mirror": "node scripts/mirror-losergod.mjs",
+    "start": "node server.mjs",
+    "verify": "node scripts/verify-losergod.mjs",
+    "test": "npm run verify"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lafinger/MockTrading.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Lafinger/MockTrading/issues"
+  },
+  "homepage": "https://github.com/Lafinger/MockTrading#readme",
+  "devDependencies": {
+    "playwright": "^1.61.1"
+  }
+}
