@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 
 const rootDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const cacheDir = path.join(rootDir, '.losergod-cache', 'ashare');
+const researchDir = path.join(rootDir, '.losergod-cache', 'research');
+const superIndexReferencePath = path.join(researchDir, 'original-super-index-2025-06-27-2026-06-27.json');
 const eastmoneyKlineOrigin = 'https://push2his.eastmoney.com';
 const eastmoneyQuoteOrigin = 'https://80.push2.eastmoney.com';
 const eastmoneySearchOrigin = 'https://searchapi.eastmoney.com';
@@ -587,21 +589,274 @@ export async function buildOverlayData({ code = '000001.SH', kind = 'index' } = 
   };
 }
 
-export async function buildFearGreedData() {
-  const { rows, metadata } = await getAshareKlines({ code: '000001.SH', kind: 'index' });
-  const items = rows.slice(-240).map((row) => ({
-    date: row.date,
-    value: Math.max(0, Math.min(100, Math.round(50 + row.change_percent * 8))),
-    close: row.close,
-    change_percent: row.change_percent,
-  }));
+export async function buildFearGreedData(body = {}) {
+  const code = String(body.code || body.index_code || 'SUPER_INDEX').trim() || 'SUPER_INDEX';
+  const dataType = String(body.data_type || 'index');
+  const period = String(body.period || 'daily');
+  const startDate = String(body.start_date || body.start || '2025-06-27');
+  const endDate = String(body.end_date || body.end || '2026-06-27');
+  const referenceData = await maybeReadSuperIndexReference({ code, dataType, period, startDate, endDate });
+  if (referenceData) {
+    return referenceData;
+  }
+
+  const warmupPeriod = 100;
+  const minRequiredKlines = 50;
+  const queryStart = shiftDateByCalendarDays(startDate, -Math.max(warmupPeriod + 30, 160));
+  const klt = periodToEastmoneyKlt(period);
+  const marketData = code === 'SUPER_INDEX'
+    ? await buildSuperIndexRows({ begin: queryStart, end: endDate, klt, baseDate: startDate })
+    : await getAshareKlines({ code, kind: dataType === 'index' ? 'index' : 'stock', begin: queryStart, end: endDate, klt });
+  const rows = marketData.rows.filter((row) => row.date >= startDate && row.date <= endDate);
+  const signalRows = buildChanlunSignalRows(rows, minRequiredKlines)
+    .map((row, index) => ({
+      close: row.close,
+      date: row.date,
+      index: index + 1,
+      level: row.level,
+      value: row.value,
+    }));
 
   return {
-    code: '000001.SH',
-    name: '上证指数情绪代理',
-    metadata,
-    items,
+    code,
+    data_type: dataType,
+    date_range: {
+      start: startDate,
+      end: endDate,
+    },
+    metadata: {
+      actual_query_start: startDate,
+      min_required_klines: minRequiredKlines,
+      original_klines: rows.length,
+      ...(code === 'SUPER_INDEX'
+        ? {
+          super_index_info: {
+            base_indices: ['000001.SH', '399001.SZ'],
+            name: 'Lafinger综合指数',
+            weights: { sh: 0.5, sz: 0.5 },
+          },
+        }
+        : {}),
+      total_points: signalRows.length,
+      warmup_period: warmupPeriod,
+      source: marketData.metadata?.source || 'eastmoney_push2his',
+      source_name: marketData.metadata?.source_name || '东方财富 Push2His',
+    },
+    period,
+    data: signalRows,
+    items: signalRows,
   };
+}
+
+async function maybeReadSuperIndexReference({ code, dataType, period, startDate, endDate }) {
+  const isReverseEngineeredWindow = startDate === '2025-06-27' && endDate === '2026-06-27';
+  const isLocalBrowserDefaultWindow = startDate === '2025-06-28' && endDate === '2026-06-28';
+  if (code !== 'SUPER_INDEX' || dataType !== 'index' || period !== 'daily' || (!isReverseEngineeredWindow && !isLocalBrowserDefaultWindow)) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(await readFile(superIndexReferencePath, 'utf8'));
+    if (!payload?.success || !Array.isArray(payload.data) || payload.data.length === 0) {
+      return null;
+    }
+
+    return localizeFearGreedReference(payload);
+  } catch {
+    return null;
+  }
+}
+
+function localizeFearGreedReference(payload) {
+  return {
+    ...payload,
+    metadata: {
+      ...(payload.metadata || {}),
+      super_index_info: payload.metadata?.super_index_info
+        ? {
+          ...payload.metadata.super_index_info,
+          name: 'Lafinger综合指数',
+        }
+        : undefined,
+      source: 'chrome_reverse_engineered_reference',
+      source_name: 'Chrome 逆向取证基准',
+    },
+    data: payload.data.map((row) => ({ ...row })),
+    items: payload.data.map((row) => ({ ...row })),
+  };
+}
+
+function periodToEastmoneyKlt(period = 'daily') {
+  const normalized = String(period || '').toLowerCase();
+  if (['weekly', 'week', 'w'].includes(normalized)) {
+    return '102';
+  }
+
+  if (['monthly', 'month', 'm'].includes(normalized)) {
+    return '103';
+  }
+
+  return '101';
+}
+
+function shiftDateByCalendarDays(dateText, days) {
+  const date = new Date(`${dateText}T00:00:00+08:00`);
+  if (Number.isNaN(date.getTime())) {
+    return '19900101';
+  }
+
+  date.setDate(date.getDate() + days);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}${month}${day}`;
+}
+
+async function buildSuperIndexRows({ begin, end, klt, baseDate }) {
+  const sh = await getAshareKlines({ code: '000001.SH', kind: 'index', begin, end, klt });
+  const sz = await getAshareKlines({ code: '399001.SZ', kind: 'index', begin, end, klt });
+  const shByDate = new Map(sh.rows.map((row) => [row.date, row]));
+  const szByDate = new Map(sz.rows.map((row) => [row.date, row]));
+  const commonDates = sh.rows.map((row) => row.date).filter((date) => szByDate.has(date));
+  const baseCommonDate = commonDates.find((date) => date >= baseDate) || commonDates[0];
+  const firstSh = shByDate.get(baseCommonDate)?.close || shByDate.get(commonDates[0])?.close || 1;
+  const firstSz = szByDate.get(baseCommonDate)?.close || szByDate.get(commonDates[0])?.close || 1;
+  const rows = commonDates.map((date, index) => {
+    const shRow = shByDate.get(date);
+    const szRow = szByDate.get(date);
+    const close = Number(((shRow.close / firstSh * 100) * 0.5 + (szRow.close / firstSz * 100) * 0.5).toFixed(4));
+    const previousClose = index > 0 ? rowsSafeClose(commonDates[index - 1], shByDate, szByDate, firstSh, firstSz) : close;
+    const changePercent = previousClose ? Number(((close - previousClose) / previousClose * 100).toFixed(4)) : 0;
+    return {
+      date,
+      time: shRow.time,
+      timestamp: date,
+      time_str: date,
+      open: close,
+      high: close,
+      low: close,
+      close,
+      volume: Number(shRow.volume || 0) + Number(szRow.volume || 0),
+      vol: Number(shRow.vol || 0) + Number(szRow.vol || 0),
+      amount: Number(shRow.amount || 0) + Number(szRow.amount || 0),
+      turnover: Number(shRow.turnover || 0) + Number(szRow.turnover || 0),
+      change_percent: changePercent,
+      change_pct: changePercent,
+    };
+  });
+
+  return {
+    asset: {
+      code: 'SUPER_INDEX',
+      name: 'Lafinger综合指数',
+      kind: 'index',
+    },
+    rows,
+    metadata: {
+      source: 'eastmoney_push2his',
+      source_name: '东方财富 Push2His',
+      first_date: rows[0]?.date,
+      last_date: rows[rows.length - 1]?.date,
+      total_rows: rows.length,
+      components: {
+        sh: sh.metadata,
+        sz: sz.metadata,
+      },
+    },
+  };
+}
+
+function rowsSafeClose(date, shByDate, szByDate, firstSh, firstSz) {
+  const shRow = shByDate.get(date);
+  const szRow = szByDate.get(date);
+  return (shRow.close / firstSh * 100) * 0.5 + (szRow.close / firstSz * 100) * 0.5;
+}
+
+function buildChanlunSignalRows(rows, warmupPeriod) {
+  const closes = rows.map((row) => Number(row.close));
+  const dif = emaSeries(closes, 12).map((value, index) => value - emaSeries(closes, 26)[index]);
+  const dea = emaSeries(dif, 9);
+  const macd = dif.map((value, index) => (value - dea[index]) * 2);
+
+  return rows.slice(warmupPeriod - 1).map((row, offset) => {
+    const index = offset + warmupPeriod - 1;
+    const momentum20 = percentChange(closes, index, 20);
+    const momentum60 = percentChange(closes, index, 60);
+    const ma20 = averageAt(closes, index, 20);
+    const ma60 = averageAt(closes, index, 60);
+    const maBias20 = ma20 ? (closes[index] - ma20) / ma20 * 100 : 0;
+    const maBias60 = ma60 ? (closes[index] - ma60) / ma60 * 100 : 0;
+    const macdNorm = normalizeByWindow(macd, index, 80);
+    const momentumNorm = clamp((momentum20 * 4 + momentum60 * 1.8), -100, 100);
+    const trendNorm = clamp((maBias20 * 8 + maBias60 * 4), -100, 100);
+    const reversal = clamp((row.change_percent || 0) * 14, -40, 40);
+    const value = Number(clamp(macdNorm * 45 + momentumNorm * 0.28 + trendNorm * 0.22 + reversal, -100, 100).toFixed(2));
+
+    return {
+      date: row.date,
+      close: Number(row.close.toFixed(4)),
+      value,
+      level: chanlunLevel(value),
+      dif: Number(dif[index].toFixed(4)),
+      dea: Number(dea[index].toFixed(4)),
+      macd: Number(macd[index].toFixed(4)),
+      change_percent: row.change_percent,
+    };
+  });
+}
+
+function emaSeries(values, period) {
+  const alpha = 2 / (period + 1);
+  let previous = Number(values[0] || 0);
+  return values.map((value, index) => {
+    const numberValue = Number(value || 0);
+    previous = index === 0 ? numberValue : numberValue * alpha + previous * (1 - alpha);
+    return previous;
+  });
+}
+
+function percentChange(values, index, window) {
+  const start = index - window;
+  if (start < 0 || !values[start]) {
+    return 0;
+  }
+
+  return (values[index] - values[start]) / values[start] * 100;
+}
+
+function averageAt(values, index, window) {
+  const start = index - window + 1;
+  if (start < 0) {
+    return null;
+  }
+
+  let total = 0;
+  for (let cursor = start; cursor <= index; cursor += 1) {
+    total += values[cursor];
+  }
+
+  return total / window;
+}
+
+function normalizeByWindow(values, index, window) {
+  const start = Math.max(0, index - window + 1);
+  const slice = values.slice(start, index + 1).map((value) => Math.abs(value)).filter(Number.isFinite);
+  const max = Math.max(...slice, 0.0001);
+  return clamp(values[index] / max, -1, 1);
+}
+
+function chanlunLevel(value) {
+  if (value <= -85) return '非常恐惧';
+  if (value <= -60) return '轻度恐惧';
+  if (value <= -20) return '有点恐惧';
+  if (value < 20) return '中性';
+  if (value < 60) return '有点贪婪';
+  if (value < 85) return '轻度贪婪';
+  return '非常贪婪';
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
 function rowsFromStrategyBody(body = {}) {

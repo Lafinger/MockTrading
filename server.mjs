@@ -1603,10 +1603,16 @@ async function handleMockApi(req, res, requestUrl) {
   }
 
   if (pathname === '/api/index_signals/super_index' || pathname === '/api/index_signals/fear_greed_index') {
-    const fearGreed = await buildFearGreedData();
+    const body = await readJsonBody(req);
+    const fearGreed = await buildFearGreedData(body);
     sendJson(res, 200, {
       success: true,
-      data: fearGreed,
+      code: fearGreed.code,
+      data: fearGreed.data,
+      data_type: fearGreed.data_type,
+      date_range: fearGreed.date_range,
+      metadata: fearGreed.metadata,
+      period: fearGreed.period,
       items: fearGreed.items,
     });
     return true;

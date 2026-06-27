@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
 import * as fs from 'node:fs/promises';
+import { networkInterfaces } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
@@ -9,6 +10,7 @@ import { chromium } from 'playwright';
 const rootDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const publicDir = path.join(rootDir, 'public');
 const chromePath = process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+const localAssetVersion = 'lafinger-local-v6';
 const requestedPort = Number(process.env.PORT || 5173);
 const port = await findFreePort(requestedPort);
 const target = `http://127.0.0.1:${port}/`;
@@ -172,6 +174,7 @@ async function verifyBrandAssets() {
     path.join(publicDir, 'index.html'),
     path.join(publicDir, 'assets/js/AboutView-FCe5Kuic.js'),
     path.join(publicDir, 'assets/js/main-Dk2YD_9z.js'),
+    path.join(publicDir, 'assets/js/KLineChart-D6bwAFvw.js'),
   ];
 
   for (const filePath of visibleFiles) {
@@ -202,15 +205,27 @@ async function verifyBrandAssets() {
   if (!indexHtml.includes('id="lafinger-brand-guard"')) {
     throw new Error('index.html missing Lafinger visible brand guard');
   }
+  if (indexHtml.includes('lafinger-local-v5')) {
+    throw new Error('index.html still references the previous local asset version');
+  }
+  if (indexHtml.includes('逆神') || indexHtml.includes('LOSERGOD')) {
+    throw new Error('index.html still contains old visible brand literals');
+  }
   if (!indexHtml.includes('CanvasRenderingContext2D') || !indexHtml.includes('rewriteText')) {
     throw new Error('index.html brand guard does not patch canvas-rendered brand text');
   }
+  if (!indexHtml.includes('OffscreenCanvasRenderingContext2D')) {
+    throw new Error('index.html brand guard does not patch offscreen canvas-rendered brand text');
+  }
+  if (!indexHtml.includes('value instanceof String')) {
+    throw new Error('index.html brand guard does not rewrite String object text');
+  }
 
   const entryAssets = [
-    '/assets/js/main-Dk2YD_9z.js?v=lafinger-local-v2',
-    '/assets/js/vendor-BHBN5ZrF.js?v=lafinger-local-v2',
-    '/assets/js/echarts-L7P-wWsq.js?v=lafinger-local-v2',
-    '/assets/css/main-Bn1PmTVz.css?v=lafinger-local-v2',
+    `/assets/js/main-Dk2YD_9z.js?v=${localAssetVersion}`,
+    `/assets/js/vendor-BHBN5ZrF.js?v=${localAssetVersion}`,
+    `/assets/js/echarts-L7P-wWsq.js?v=${localAssetVersion}`,
+    `/assets/css/main-Bn1PmTVz.css?v=${localAssetVersion}`,
   ];
   const missingEntryAssets = entryAssets.filter((asset) => !indexHtml.includes(asset));
   if (missingEntryAssets.length > 0) {
@@ -219,15 +234,36 @@ async function verifyBrandAssets() {
 
   const mainBundle = await fs.readFile(path.join(publicDir, 'assets/js/main-Dk2YD_9z.js'), 'utf8');
   const dynamicImports = [
-    './AboutView-FCe5Kuic.js?v=lafinger-local-v2',
-    './senior_TrainingPk-BkGLJXH4.js?v=lafinger-local-v2',
+    `./AboutView-FCe5Kuic.js?v=${localAssetVersion}`,
+    `./senior_TrainingPk-BkGLJXH4.js?v=${localAssetVersion}`,
   ];
   const missingDynamicImports = dynamicImports.filter((asset) => !mainBundle.includes(asset));
   if (missingDynamicImports.length > 0) {
     throw new Error(`main bundle missing local cache-busted dynamic imports: ${missingDynamicImports.join(', ')}`);
   }
-  if (/assets\/css\/[^"'?#]+\.css\?v=lafinger-local-v2/.test(mainBundle)) {
+  if (new RegExp(`assets/css/[^"'?#]+\\.css\\?v=${localAssetVersion}`).test(mainBundle)) {
     throw new Error('main bundle incorrectly cache-busts CSS runtime dependencies as module imports');
+  }
+
+  const seniorTrainingBundle = await fs.readFile(path.join(publicDir, 'assets/js/senior_TrainingPk-BkGLJXH4.js'), 'utf8');
+  if (!seniorTrainingBundle.includes(`from"./KLineChart-D6bwAFvw.js?v=${localAssetVersion}"`)) {
+    throw new Error('senior training page can still load a cached KLineChart chunk with the old watermark');
+  }
+
+  const assetNames = await fs.readdir(path.join(publicDir, 'assets/js'));
+  const klineChartBundles = assetNames.filter((name) => /^KLineChart-.+\.js$/.test(name));
+  if (klineChartBundles.length === 0) {
+    throw new Error('no KLineChart bundles found');
+  }
+
+  for (const bundleName of klineChartBundles) {
+    const klineChartBundle = await fs.readFile(path.join(publicDir, 'assets/js', bundleName), 'utf8');
+    if (!klineChartBundle.includes('text:"Lafinger"')) {
+      throw new Error(`${bundleName} watermark is not Lafinger`);
+    }
+    if (klineChartBundle.includes('逆神') || klineChartBundle.includes('LOSERGOD')) {
+      throw new Error(`${bundleName} still contains old watermark text`);
+    }
   }
 }
 
@@ -238,8 +274,8 @@ function stripBrandGuard(text) {
 async function verifyStaticCacheHeaders(target) {
   const assets = [
     '/',
-    '/assets/js/main-Dk2YD_9z.js?v=lafinger-local-v2',
-    '/assets/js/AboutView-FCe5Kuic.js?v=lafinger-local-v2',
+    `/assets/js/main-Dk2YD_9z.js?v=${localAssetVersion}`,
+    `/assets/js/AboutView-FCe5Kuic.js?v=${localAssetVersion}`,
   ];
 
   for (const asset of assets) {
@@ -491,6 +527,143 @@ async function verifyStrategySignalsApi(target) {
     throw new Error(`strategy signal verification failed: ${JSON.stringify({
       success: strategyPayload.success,
       signalRows: signals?.length,
+    })}`);
+  }
+}
+
+function getLanUrlsForPort(portToUse) {
+  const urls = [];
+  for (const entries of Object.values(networkInterfaces())) {
+    for (const entry of entries || []) {
+      if (entry.family === 'IPv4' && !entry.internal) {
+        urls.push(`http://${entry.address}:${portToUse}/`);
+      }
+    }
+  }
+
+  return urls;
+}
+
+async function verifyLanAccess(portToUse) {
+  const urls = getLanUrlsForPort(portToUse);
+  if (urls.length === 0) {
+    throw new Error('no active LAN IPv4 address found for LAN access verification');
+  }
+
+  const failures = [];
+  for (const url of urls) {
+    try {
+      const response = await fetch(url);
+      const text = await response.text();
+      if (response.ok && text.includes(`v=${localAssetVersion}`) && text.includes('lafinger-brand-guard')) {
+        return url;
+      }
+      failures.push(`${url} HTTP ${response.status}`);
+    } catch (error) {
+      failures.push(`${url} ${error.message}`);
+    }
+  }
+
+  throw new Error(`LAN access verification failed: ${failures.join(' | ')}`);
+}
+
+async function verifyFearGreedIndexApi(target) {
+  const requestPayloads = [
+    {
+      code: 'SUPER_INDEX',
+      data_type: 'index',
+      period: 'daily',
+      start_date: '2025-06-27',
+      end_date: '2026-06-27',
+    },
+    {
+      code: 'SUPER_INDEX',
+      data_type: 'index',
+      period: 'daily',
+      start_date: '2025-06-28',
+      end_date: '2026-06-28',
+    },
+  ];
+
+  for (const requestPayload of requestPayloads) {
+    await verifyFearGreedIndexPayload(target, requestPayload);
+  }
+}
+
+async function verifyFearGreedIndexPayload(target, requestPayload) {
+  const response = await fetch(new URL('/api/index_signals/super_index', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(requestPayload),
+  });
+
+  if (!response.ok) {
+    throw new Error(`fear greed index request failed for ${requestPayload.start_date}..${requestPayload.end_date}: HTTP ${response.status}`);
+  }
+
+  const payload = await response.json();
+  const rows = payload.data;
+  if (!payload.success || !Array.isArray(rows) || rows.length < 100) {
+    throw new Error(`fear greed index response must match original array shape for ${requestPayload.start_date}..${requestPayload.end_date}: ${JSON.stringify({
+      success: payload.success,
+      dataIsArray: Array.isArray(rows),
+      rows: Array.isArray(rows) ? rows.length : null,
+      topKeys: Object.keys(payload || {}),
+    })}`);
+  }
+
+  const requiredFields = ['date', 'index', 'close', 'value', 'level'];
+  const missingFields = requiredFields.filter((field) => rows.some((row) => row[field] === undefined || row[field] === null || row[field] === ''));
+  const values = rows.map((row) => Number(row.value)).filter(Number.isFinite);
+  const hasNegativeValue = values.some((value) => value < 0);
+  const hasPositiveValue = values.some((value) => value > 0);
+  const outOfRange = values.filter((value) => value < -100 || value > 100);
+  const levels = new Set(rows.map((row) => row.level).filter(Boolean));
+  const firstRow = rows[0] || {};
+  const lastRow = rows[rows.length - 1] || {};
+  const hasOriginalLikeMetadata = payload.code === 'SUPER_INDEX' &&
+    payload.data_type === 'index' &&
+    payload.period === 'daily' &&
+    payload.metadata?.original_klines === 242 &&
+    payload.metadata?.total_points === 193 &&
+    payload.metadata?.warmup_period === 100 &&
+    payload.metadata?.super_index_info?.weights?.sh === 0.5 &&
+    payload.metadata?.super_index_info?.weights?.sz === 0.5;
+
+  if (
+    rows.length !== 193 ||
+    firstRow.date !== '2025-09-04' ||
+    lastRow.date !== '2026-06-26' ||
+    Math.abs(Number(firstRow.close) - 113.3721) > 0.02 ||
+    Math.abs(Number(lastRow.close) - 134.8383) > 0.02 ||
+    Math.abs(Number(firstRow.value) - 11.88) > 0.05 ||
+    Math.abs(Number(lastRow.value) - (-65.49)) > 0.05 ||
+    Math.abs(Math.min(...values) - (-84.64)) > 0.05 ||
+    Math.abs(Math.max(...values) - 87.81) > 0.05 ||
+    missingFields.length > 0 ||
+    !hasNegativeValue ||
+    !hasPositiveValue ||
+    outOfRange.length > 0 ||
+    levels.size < 4 ||
+    !hasOriginalLikeMetadata
+  ) {
+    throw new Error(`fear greed index response invalid for ${requestPayload.start_date}..${requestPayload.end_date}: ${JSON.stringify({
+      rows: rows.length,
+      firstDate: firstRow.date,
+      lastDate: lastRow.date,
+      firstClose: firstRow.close,
+      lastClose: lastRow.close,
+      firstValue: firstRow.value,
+      lastValue: lastRow.value,
+      missingFields,
+      valueMin: values.length ? Math.min(...values) : null,
+      valueMax: values.length ? Math.max(...values) : null,
+      outOfRange: outOfRange.length,
+      levels: Array.from(levels),
+      metadata: payload.metadata,
+      code: payload.code,
+      data_type: payload.data_type,
+      period: payload.period,
     })}`);
   }
 }
@@ -906,6 +1079,24 @@ async function verifySeniorTrainingParamsCanEnter(page, events, target) {
     throw new Error(`/senior_training_pk/training_pk stock title did not show a stock name: ${stockTitle || '<empty>'}`);
   }
 
+  const canvasBrandProbe = await page.evaluate(() => {
+    const rewritten = window.__lafingerBrandGuard?.rewriteText?.('逆神 | LOSERGOD');
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d');
+    context.font = 'bold 60px Microsoft YaHei';
+    const oldWidth = context.measureText('逆神 | LOSERGOD').width;
+    const newWidth = context.measureText('Lafinger').width;
+    return {
+      rewritten,
+      oldWidth,
+      newWidth,
+      sameWidth: Math.abs(oldWidth - newWidth) < 0.01,
+    };
+  });
+  if (canvasBrandProbe.rewritten !== 'Lafinger' || !canvasBrandProbe.sameWidth) {
+    throw new Error(`/senior_training_pk/training_pk canvas brand guard failed: ${JSON.stringify(canvasBrandProbe)}`);
+  }
+
   const routeEvents = events.slice(eventStart);
   const fatalEvents = routeEvents.filter((event) => (
     event.startsWith('pageerror:') ||
@@ -929,9 +1120,11 @@ try {
   await waitForServer(server);
   await verifyBrandAssets();
   await verifyStaticCacheHeaders(target);
+  await verifyLanAccess(port);
   await verifyRealAshareData(target);
   await verifySeniorTrainingParamsPayload(target);
   await verifyStrategySignalsApi(target);
+  await verifyFearGreedIndexApi(target);
   const accounts = await verifyAuthAccounts(target);
   const trainingRecordVerification = await verifyTrainingRecordPersistence(target, accounts);
 
@@ -999,6 +1192,7 @@ try {
       ['/pattern-search', ['AI画图选股搜索', '历史记录']],
       ['/quant-flow', ['量化策略回测', '选择标的']],
       ['/ai-stock-analysis', ['AI股票分析', '快速分析']],
+      ['/losergod-fear-greed-index', ['Lafinger缠论指标', '恐惧', '贪婪']],
       ['/full-position-training', ['可用虚拟资金']],
       ['/futures-trading-plus/params', ['商品期货（排位）', '期货品种']],
       ['/virtual_exchange/trade', ['K线', '盘口', '最近成交']],
