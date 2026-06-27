@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { createReadStream } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -16,6 +16,8 @@ import {
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(rootDir, 'public');
+const cacheDir = path.join(rootDir, '.losergod-cache');
+const trainingStorePath = path.join(cacheDir, 'training-records.json');
 const port = Number(process.env.PORT || 5173);
 const apiMode = process.env.LOSERGOD_API || 'mock';
 const upstreamOrigin = 'https://www.losergod.com';
@@ -184,6 +186,527 @@ function getPortfolioRows() {
       updated_at: '2026-06-27T15:00:00+08:00',
     },
   ];
+}
+
+function getSeedTrainingRecords() {
+  return [
+    createTrainingRecord({
+      record_id: 'local-seed-training-001',
+      id: 'local-seed-training-001',
+      phone: '13800138000',
+      stock_code: '000001.SZ',
+      stock_name: '平安银行',
+      start_time: '2026-01-02',
+      end_time: '2026-05-29',
+      created_at: '2026-06-01T10:00:00+08:00',
+      initial_capital: 100000,
+      final_capital: 106800,
+      total_profit: 6800,
+      stock_range_profit_rate: 0.0412,
+      operation_profit_rate: 0.068,
+      excess_profit_rate: 0.0268,
+      strategy_total_profit: 5200,
+      strategy_profit_rate: 0.052,
+      mode: 'stock',
+      trade_datas: [],
+      strategy_trades: [],
+    }),
+    createTrainingRecord({
+      record_id: 'local-seed-training-002',
+      id: 'local-seed-training-002',
+      phone: '13800138000',
+      stock_code: '600000.SH',
+      stock_name: '浦发银行',
+      start_time: '2026-02-03',
+      end_time: '2026-06-12',
+      created_at: '2026-06-10T10:00:00+08:00',
+      initial_capital: 100000,
+      final_capital: 112400,
+      total_profit: 12400,
+      stock_range_profit_rate: 0.086,
+      operation_profit_rate: 0.124,
+      excess_profit_rate: 0.038,
+      strategy_total_profit: 9800,
+      strategy_profit_rate: 0.098,
+      mode: 'stock',
+      trade_datas: [],
+      strategy_trades: [],
+    }),
+    createTrainingRecord({
+      record_id: 'local-seed-training-003',
+      id: 'local-seed-training-003',
+      phone: '13800138000',
+      stock_code: '600519.SH',
+      stock_name: '贵州茅台',
+      start_time: '2026-03-02',
+      end_time: '2026-06-26',
+      created_at: '2026-06-20T10:00:00+08:00',
+      initial_capital: 100000,
+      final_capital: 153500,
+      total_profit: 53500,
+      stock_range_profit_rate: 0.432,
+      operation_profit_rate: 0.535,
+      excess_profit_rate: 0.103,
+      strategy_total_profit: 41800,
+      strategy_profit_rate: 0.418,
+      mode: 'stock',
+      trade_datas: [],
+      strategy_trades: [],
+    }),
+  ];
+}
+
+async function readTrainingStore() {
+  try {
+    const text = await readFile(trainingStorePath, 'utf8');
+    const store = JSON.parse(text);
+    return {
+      records: Array.isArray(store.records) ? store.records : [],
+      sessions: store.sessions && typeof store.sessions === 'object' ? store.sessions : {},
+      klineData: store.klineData && typeof store.klineData === 'object' ? store.klineData : {},
+    };
+  } catch {
+    return { records: [], sessions: {}, klineData: {} };
+  }
+}
+
+async function writeTrainingStore(store) {
+  await mkdir(cacheDir, { recursive: true });
+  await writeFile(trainingStorePath, JSON.stringify(store, null, 2), 'utf8');
+}
+
+function numberOr(value, fallback = 0) {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : fallback;
+}
+
+function stringOr(value, fallback = '') {
+  const text = String(value ?? '').trim();
+  return text || fallback;
+}
+
+function createRecordId(prefix = 'local-training') {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeTradeItems(items = []) {
+  return (Array.isArray(items) ? items : []).map((item, index) => {
+    const tradeType = item.trade_type || (String(item.type || '').includes('sell') ? 'sell' : 'buy');
+    const price = numberOr(item.price, 0);
+    const amount = numberOr(item.amount, item.quantity || 0);
+    return {
+      ...item,
+      trade_type: tradeType,
+      price,
+      amount,
+      total: numberOr(item.total ?? item.total_amount, price * amount),
+      total_amount: numberOr(item.total_amount ?? item.total, price * amount),
+      kline_index: numberOr(item.kline_index ?? item.index ?? item.time, index),
+      profit: numberOr(item.profit, 0),
+      commission: numberOr(item.commission, 0),
+    };
+  });
+}
+
+function firstKlineTimestamp(rows = []) {
+  const row = rows.find((item) => item?.timestamp || item?.date || item?.trade_date || item?.time_str);
+  return String(row?.timestamp || row?.date || row?.trade_date || row?.time_str || '');
+}
+
+function lastKlineTimestamp(rows = []) {
+  const row = [...rows].reverse().find((item) => item?.timestamp || item?.date || item?.trade_date || item?.time_str);
+  return String(row?.timestamp || row?.date || row?.trade_date || row?.time_str || '');
+}
+
+function normalizeKlineRows(rows = []) {
+  return (Array.isArray(rows) ? rows : []).map((row, index) => ({
+    ...row,
+    index: row.index ?? index + 1,
+    time: row.time ?? index + 1,
+    open: numberOr(row.open, row.close),
+    high: numberOr(row.high, row.close),
+    low: numberOr(row.low, row.close),
+    close: numberOr(row.close, row.open),
+    volume: numberOr(row.volume ?? row.vol, 0),
+    timestamp: String(row.timestamp || row.date || row.trade_date || row.time_str || index + 1),
+  }));
+}
+
+function createTrainingRecord(rawRecord = {}, session = {}) {
+  const now = new Date().toISOString();
+  const klineRows = normalizeKlineRows(rawRecord.kline_data || rawRecord.full_kline_data || session.kline_data || []);
+  const recordId = stringOr(rawRecord.record_id || rawRecord.id || rawRecord._id, createRecordId());
+  const initialCapital = numberOr(rawRecord.initial_capital ?? rawRecord.initial_funds ?? rawRecord.initialAmount, 100000);
+  const totalProfit = numberOr(rawRecord.total_profit, numberOr(rawRecord.final_capital ?? rawRecord.final_assets, initialCapital) - initialCapital);
+  const finalCapital = numberOr(rawRecord.final_capital ?? rawRecord.final_assets, initialCapital + totalProfit);
+  const operationProfitRate = numberOr(rawRecord.operation_profit_rate ?? rawRecord.total_profit_rate, initialCapital ? totalProfit / initialCapital : 0);
+  const stockRangeProfitRate = numberOr(rawRecord.stock_range_profit_rate, 0);
+  const excessProfitRate = numberOr(rawRecord.excess_profit_rate, operationProfitRate - stockRangeProfitRate);
+  const strategyTotalProfit = numberOr(rawRecord.strategy_total_profit, 0);
+  const strategyProfitRate = numberOr(rawRecord.strategy_profit_rate, initialCapital ? strategyTotalProfit / initialCapital : 0);
+  const phone = stringOr(rawRecord.phone || session.phone, '13800138000');
+  const stockCode = stringOr(rawRecord.stock_code || rawRecord.code || session.stock_code, '000001.SZ');
+  const stockName = stringOr(rawRecord.stock_name || rawRecord.name || session.stock_name, stockCode);
+  const startTime = stringOr(rawRecord.start_time, firstKlineTimestamp(klineRows) || '2026-01-02');
+  const endTime = stringOr(rawRecord.end_time, lastKlineTimestamp(klineRows) || now);
+  const rawMode = stringOr(rawRecord.mode || rawRecord.index_mode || session.mode, 'stock');
+  const mode = rawMode === 'Full_Position_Training_pk' ? 'full_position' : rawMode;
+  const tradeDatas = normalizeTradeItems(rawRecord.trade_datas || rawRecord.trade_data || rawRecord.trades || session.trade_history || []);
+  const strategyTrades = normalizeTradeItems(rawRecord.strategy_trades || rawRecord.strategyTrades || []);
+  const sessionKey = stringOr(rawRecord.sessionKey || rawRecord.session_key || session.session_code || session.sessionCode, recordId);
+
+  return {
+    ...rawRecord,
+    id: recordId,
+    _id: recordId,
+    record_id: recordId,
+    phone,
+    user_id: stringOr(rawRecord.user_id || rawRecord.userId, phone),
+    stock_code: stockCode,
+    stock_name: stockName,
+    start_time: startTime,
+    end_time: endTime,
+    created_at: stringOr(rawRecord.created_at || rawRecord.create_time, now),
+    updated_at: now,
+    initial_capital: initialCapital,
+    final_capital: finalCapital,
+    final_assets: finalCapital,
+    total_profit: totalProfit,
+    stock_range_profit_rate: stockRangeProfitRate,
+    operation_profit_rate: operationProfitRate,
+    total_profit_rate: operationProfitRate,
+    excess_profit_rate: excessProfitRate,
+    strategy_total_profit: strategyTotalProfit,
+    strategy_profit_rate: strategyProfitRate,
+    strategy_trade_times: numberOr(rawRecord.strategy_trade_times, strategyTrades.length),
+    user_trade_times: numberOr(rawRecord.user_trade_times, tradeDatas.length),
+    trade_times: numberOr(rawRecord.trade_times, tradeDatas.length),
+    observe_bars: numberOr(rawRecord.observe_bars ?? rawRecord.observe_days, 200),
+    train_bars: numberOr(rawRecord.train_bars ?? rawRecord.train_days, 100),
+    mode,
+    period: stringOr(rawRecord.period, 'day'),
+    pk_result: stringOr(rawRecord.pk_result, '平'),
+    position_strategy: stringOr(rawRecord.position_strategy, rawRecord.strategy_name || '固定仓位'),
+    signals_strategy: stringOr(rawRecord.signals_strategy, rawRecord.strategy_type || '均线金叉'),
+    strategy_name: stringOr(rawRecord.strategy_name, rawRecord.position_strategy || '固定仓位'),
+    strategy_type: stringOr(rawRecord.strategy_type, rawRecord.signals_strategy || '均线金叉'),
+    source_mode: stringOr(rawRecord.source_mode, rawMode),
+    trade_datas: tradeDatas,
+    strategy_trades: strategyTrades,
+    sessionKey,
+    session_key: sessionKey,
+  };
+}
+
+function createKlineLookbackData(record, rawRecord = {}, session = {}) {
+  const rows = normalizeKlineRows(
+    rawRecord.kline_data ||
+    rawRecord.full_kline_data ||
+    rawRecord.stock_data ||
+    rawRecord.stockData ||
+    session.kline_data ||
+    [],
+  );
+  const observeBars = numberOr(record.observe_bars, 200);
+  const trainBars = numberOr(record.train_bars, Math.max(0, rows.length - observeBars));
+
+  return {
+    record_id: record.record_id,
+    stock_code: record.stock_code,
+    stock_name: record.stock_name,
+    start_time: record.start_time,
+    end_time: record.end_time,
+    observe_bars: observeBars,
+    train_bars: trainBars,
+    total_bars: rows.length || observeBars + trainBars,
+    period: record.period || 'day',
+    full_kline_data: rows,
+    kline_data: rows,
+  };
+}
+
+async function saveTrainingRecord(rawRecord = {}, session = {}) {
+  const store = await readTrainingStore();
+  const record = createTrainingRecord(rawRecord, session);
+  const klineData = createKlineLookbackData(record, rawRecord, session);
+  const existingIndex = store.records.findIndex((item) => (
+    item.record_id === record.record_id ||
+    item.session_key && item.session_key === record.session_key
+  ));
+
+  if (existingIndex >= 0) {
+    store.records[existingIndex] = { ...store.records[existingIndex], ...record };
+  } else {
+    store.records.unshift(record);
+  }
+
+  store.klineData[record.record_id] = klineData;
+  await writeTrainingStore(store);
+  return { record, klineData, store };
+}
+
+function getTrainingModeAliases(mode) {
+  const aliases = new Set([mode]);
+  if (mode === 'Full_Position_Training_pk' || mode === 'full_position' || mode === 'full-position') {
+    aliases.add('Full_Position_Training_pk');
+    aliases.add('full_position');
+    aliases.add('full-position');
+  }
+
+  return aliases;
+}
+
+function filterTrainingRecords(records, requestUrl) {
+  const phone = requestUrl.searchParams.get('phone') || requestUrl.searchParams.get('user_id') || '';
+  const modes = (requestUrl.searchParams.get('modes') || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const afterTime = requestUrl.searchParams.get('after_time') || '';
+
+  return records.filter((record) => {
+    if (phone && record.phone !== phone && record.user_id !== phone) {
+      return false;
+    }
+
+    const recordModes = getTrainingModeAliases(record.mode);
+    if (modes.length > 0 && !modes.some((mode) => recordModes.has(mode))) {
+      return false;
+    }
+
+    if (afterTime && String(record.created_at) <= afterTime) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+async function getAllTrainingRecords() {
+  const store = await readTrainingStore();
+  const recordsById = new Map();
+  for (const record of [...store.records, ...getSeedTrainingRecords()]) {
+    recordsById.set(record.record_id || record.id, createTrainingRecord(record));
+  }
+
+  return Array.from(recordsById.values()).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+}
+
+async function handleTrainingRecordsApi(req, res, requestUrl) {
+  if (req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const rawRecord = body.training_record || body.record || body;
+    const { record } = await saveTrainingRecord(rawRecord);
+    sendJson(res, 200, {
+      success: true,
+      message: '训练记录保存成功',
+      data: record,
+      record,
+      record_id: record.record_id,
+      id: record.id,
+    });
+    return true;
+  }
+
+  const page = Math.max(1, numberOr(requestUrl.searchParams.get('page'), 1));
+  const pageSize = Math.max(1, numberOr(requestUrl.searchParams.get('pageSize') || requestUrl.searchParams.get('limit'), 20));
+  const records = filterTrainingRecords(await getAllTrainingRecords(), requestUrl);
+  const start = (page - 1) * pageSize;
+  const pageRecords = records.slice(start, start + pageSize);
+
+  sendJson(res, 200, {
+    success: true,
+    data: {
+      records: pageRecords,
+      total: records.length,
+      page,
+      pageSize,
+      filter_info: {
+        returned: pageRecords.length,
+        total: records.length,
+      },
+    },
+    records: pageRecords,
+    total: records.length,
+  });
+  return true;
+}
+
+async function handleTrainingPkSessionsApi(req, res, requestUrl) {
+  const pathname = requestUrl.pathname;
+  const store = await readTrainingStore();
+
+  if (pathname === '/api/training-pk-sessions/check' || pathname === '/api/training-pk-sessions/check-latest-index') {
+    const phone = requestUrl.searchParams.get('phone') || '13800138000';
+    const latestSession = Object.values(store.sessions)
+      .filter((session) => session.phone === phone && session.status !== 'completed')
+      .sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))[0] || null;
+    sendJson(res, 200, {
+      success: true,
+      has_unfinished: Boolean(latestSession),
+      has_session: Boolean(latestSession),
+      latest_index: latestSession?.latest_index ?? latestSession?.operations?.length ?? 0,
+      session_code: latestSession?.session_code || null,
+      sessionCode: latestSession?.session_code || null,
+      data: latestSession,
+      session: latestSession,
+    });
+    return true;
+  }
+
+  if (pathname === '/api/training-pk-sessions' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const sessionCode = createRecordId('local-pk-session');
+    const now = new Date().toISOString();
+    const session = {
+      session_code: sessionCode,
+      sessionCode,
+      phone: stringOr(body.phone, '13800138000'),
+      stock_code: stringOr(body.stock_code || body.code, '000001.SZ'),
+      stock_name: stringOr(body.stock_name || body.name, body.stock_code || '000001.SZ'),
+      mode: stringOr(body.mode, 'Full_Position_Training_pk'),
+      status: 'active',
+      operations: [],
+      trade_history: [],
+      kline_data: [],
+      latest_index: 0,
+      created_at: now,
+      updated_at: now,
+    };
+    store.sessions[sessionCode] = session;
+    await writeTrainingStore(store);
+    sendJson(res, 200, {
+      success: true,
+      message: '会话创建成功',
+      data: session,
+      session,
+      session_code: sessionCode,
+      sessionCode,
+    });
+    return true;
+  }
+
+  if (pathname === '/api/training-pk-sessions' && req.method === 'GET') {
+    const sessionsList = Object.values(store.sessions);
+    sendJson(res, 200, { success: true, data: sessionsList, list: sessionsList, total: sessionsList.length });
+    return true;
+  }
+
+  const match = pathname.match(/^\/api\/training-pk-sessions\/([^/]+)(?:\/(complete))?$/);
+  if (!match) {
+    return false;
+  }
+
+  const sessionCode = decodeURIComponent(match[1]);
+  const action = match[2] || '';
+  const session = store.sessions[sessionCode] || {
+    session_code: sessionCode,
+    sessionCode: sessionCode,
+    phone: requestUrl.searchParams.get('phone') || '13800138000',
+    stock_code: '000001.SZ',
+    stock_name: '000001.SZ',
+    mode: 'Full_Position_Training_pk',
+    status: 'active',
+    operations: [],
+    trade_history: [],
+    kline_data: [],
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
+  if (req.method === 'GET') {
+    sendJson(res, 200, { success: true, data: session, session });
+    return true;
+  }
+
+  if (req.method === 'PUT') {
+    const body = await readJsonBody(req);
+    const updatedSession = {
+      ...session,
+      phone: stringOr(body.phone || session.phone, '13800138000'),
+      operations: Array.isArray(body.operations) ? body.operations : session.operations,
+      trade_history: Array.isArray(body.trade_history) ? body.trade_history : session.trade_history,
+      kline_data: Array.isArray(body.kline_data) ? body.kline_data : session.kline_data,
+      latest_index: numberOr(body.current_index ?? body.latest_index, session.latest_index || 0),
+      updated_at: new Date().toISOString(),
+    };
+    store.sessions[sessionCode] = updatedSession;
+    await writeTrainingStore(store);
+    sendJson(res, 200, { success: true, message: '会话更新成功', data: updatedSession, session: updatedSession });
+    return true;
+  }
+
+  if (req.method === 'POST' && action === 'complete') {
+    const body = await readJsonBody(req);
+    const rawRecord = body.training_record || body.record || {};
+    const completedSession = {
+      ...session,
+      phone: stringOr(body.phone || rawRecord.phone || session.phone, '13800138000'),
+      status: 'completed',
+      updated_at: new Date().toISOString(),
+    };
+    const recordInput = {
+      ...rawRecord,
+      phone: completedSession.phone,
+      stock_code: rawRecord.stock_code || completedSession.stock_code,
+      stock_name: rawRecord.stock_name || completedSession.stock_name,
+      kline_data: rawRecord.kline_data || completedSession.kline_data,
+      trade_datas: rawRecord.trade_datas || completedSession.trade_history,
+      session_key: sessionCode,
+      sessionKey: sessionCode,
+    };
+    const { record, klineData } = await saveTrainingRecord(recordInput, completedSession);
+    completedSession.record_id = record.record_id;
+    completedSession.kline_data = klineData.full_kline_data;
+    store.sessions[sessionCode] = completedSession;
+    store.klineData[record.record_id] = klineData;
+    const recordIndex = store.records.findIndex((item) => item.record_id === record.record_id);
+    if (recordIndex >= 0) {
+      store.records[recordIndex] = record;
+    } else {
+      store.records.unshift(record);
+    }
+    await writeTrainingStore(store);
+    sendJson(res, 200, {
+      success: true,
+      message: 'PK记录保存成功',
+      data: record,
+      record,
+      record_id: record.record_id,
+      session_code: sessionCode,
+    });
+    return true;
+  }
+
+  return false;
+}
+
+async function handleLookbackApi(req, res, requestUrl) {
+  const recordMatch = requestUrl.pathname.match(/^\/api\/lookback\/training-record\/([^/]+)$/);
+  const klineMatch = requestUrl.pathname.match(/^\/api\/lookback\/kline-data\/([^/]+)$/);
+  if (!recordMatch && !klineMatch) {
+    return false;
+  }
+
+  const recordId = decodeURIComponent((recordMatch || klineMatch)[1]);
+  const store = await readTrainingStore();
+  const record = [...store.records, ...getSeedTrainingRecords()].find((item) => item.record_id === recordId || item.id === recordId);
+
+  if (!record) {
+    sendJson(res, 404, { success: false, message: '训练记录不存在' });
+    return true;
+  }
+
+  if (recordMatch) {
+    sendJson(res, 200, { success: true, data: createTrainingRecord(record) });
+    return true;
+  }
+
+  sendJson(res, 200, {
+    success: true,
+    data: store.klineData[record.record_id] || createKlineLookbackData(createTrainingRecord(record), record),
+  });
+  return true;
 }
 
 function getIndexRows() {
@@ -587,20 +1110,15 @@ async function handleMockApi(req, res, requestUrl) {
   }
 
   if (pathname === '/api/training-records') {
-    sendJson(res, 200, {
-      success: true,
-      data: {
-        records: [
-          { id: 1, created_at: '2026-06-01', final_assets: 106800, total_profit_rate: 6.8, mode: 'stock' },
-          { id: 2, created_at: '2026-06-10', final_assets: 112400, total_profit_rate: 12.4, mode: 'stock' },
-          { id: 3, created_at: '2026-06-20', final_assets: 153500, total_profit_rate: 53.5, mode: 'stock' },
-        ],
-        total: 3,
-      },
-      records: [],
-      total: 3,
-    });
-    return true;
+    return handleTrainingRecordsApi(req, res, requestUrl);
+  }
+
+  if (pathname.startsWith('/api/training-pk-sessions')) {
+    return handleTrainingPkSessionsApi(req, res, requestUrl);
+  }
+
+  if (pathname.startsWith('/api/lookback/')) {
+    return handleLookbackApi(req, res, requestUrl);
   }
 
   if (pathname === '/api/users/leaderboard') {
@@ -771,7 +1289,7 @@ async function handleMockApi(req, res, requestUrl) {
     return true;
   }
 
-  if (pathname === '/api/strategy_statistics/all_strategies' || pathname === '/api/training-pk-sessions') {
+  if (pathname === '/api/strategy_statistics/all_strategies') {
     sendJson(res, 200, { success: true, data: [], list: [], total: 0 });
     return true;
   }

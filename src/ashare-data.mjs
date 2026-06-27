@@ -491,22 +491,187 @@ export async function buildFearGreedData() {
   };
 }
 
+function rowsFromStrategyBody(body = {}) {
+  const directRows = [
+    body.data,
+    body.stock_data,
+    body.stockData,
+    body.kline_data,
+    body.klines,
+    body.rows,
+  ].find((items) => Array.isArray(items) && items.length > 0);
+
+  if (directRows) {
+    return directRows;
+  }
+
+  if (Array.isArray(body.observe_data) || Array.isArray(body.train_data)) {
+    return [
+      ...(Array.isArray(body.observe_data) ? body.observe_data : []),
+      ...(Array.isArray(body.train_data) ? body.train_data : []),
+    ];
+  }
+
+  return [];
+}
+
+function normalizeStrategyRows(rows = []) {
+  return rows
+    .map((row, index) => ({
+      ...row,
+      close: Number(row.close),
+      open: Number(row.open),
+      high: Number(row.high),
+      low: Number(row.low),
+      volume: Number(row.volume ?? row.vol ?? 0),
+      date: row.date || row.timestamp || row.time_str || String(index + 1),
+      strategyIndex: Number.isInteger(row.index) ? row.index : index,
+    }))
+    .filter((row) => Number.isFinite(row.close));
+}
+
+function normalizeWindow(value, fallback) {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) && numberValue > 0 ? Math.floor(numberValue) : fallback;
+}
+
+function normalizePositionPercent(positionParams = {}) {
+  const rawRatio = positionParams.ratio ?? positionParams.position ?? positionParams.position_ratio ??
+    positionParams.max_ratio ?? positionParams.min_ratio ?? 0.5;
+  const ratio = Number(rawRatio);
+  if (!Number.isFinite(ratio) || ratio <= 0) {
+    return 50;
+  }
+
+  return Math.max(1, Math.min(100, ratio <= 1 ? ratio * 100 : ratio));
+}
+
+function averageClose(rows, endIndex, window) {
+  const startIndex = endIndex - window + 1;
+  if (startIndex < 0) {
+    return null;
+  }
+
+  let total = 0;
+  for (let index = startIndex; index <= endIndex; index += 1) {
+    total += rows[index].close;
+  }
+
+  return total / window;
+}
+
+function createSignal(row, type, strategy, positionPercent) {
+  return {
+    index: row.strategyIndex,
+    type,
+    signal: type,
+    strategy,
+    position: positionPercent,
+    position_ratio: positionPercent,
+    price: row.close,
+    date: row.date,
+    timestamp: row.timestamp || row.date,
+  };
+}
+
+function buildMaCrossSignals(rows, signalParams, strategy, positionPercent) {
+  let shortWindow = normalizeWindow(signalParams.short_window ?? signalParams.short_period ?? signalParams.fast_period, 5);
+  let longWindow = normalizeWindow(signalParams.long_window ?? signalParams.long_period ?? signalParams.slow_period, 20);
+
+  if (shortWindow >= longWindow) {
+    [shortWindow, longWindow] = [Math.max(1, Math.min(shortWindow, longWindow - 1)), Math.max(shortWindow + 1, longWindow)];
+  }
+
+  const signals = [];
+  for (let index = longWindow; index < rows.length; index += 1) {
+    const previousShort = averageClose(rows, index - 1, shortWindow);
+    const previousLong = averageClose(rows, index - 1, longWindow);
+    const currentShort = averageClose(rows, index, shortWindow);
+    const currentLong = averageClose(rows, index, longWindow);
+    if ([previousShort, previousLong, currentShort, currentLong].some((value) => value === null)) {
+      continue;
+    }
+
+    if (previousShort <= previousLong && currentShort > currentLong) {
+      signals.push(createSignal(rows[index], 'buy', strategy, positionPercent));
+    } else if (previousShort >= previousLong && currentShort < currentLong) {
+      signals.push(createSignal(rows[index], 'sell', strategy, positionPercent));
+    }
+  }
+
+  return signals;
+}
+
+function buildBreakoutSignals(rows, signalParams, strategy, positionPercent) {
+  const lookback = normalizeWindow(signalParams.lookback ?? signalParams.window ?? signalParams.period, 20);
+  const signals = [];
+
+  for (let index = lookback; index < rows.length; index += 1) {
+    const previousRows = rows.slice(index - lookback, index);
+    const highestClose = Math.max(...previousRows.map((row) => row.close));
+    const lowestClose = Math.min(...previousRows.map((row) => row.close));
+    if (rows[index].close > highestClose) {
+      signals.push(createSignal(rows[index], 'buy', strategy, positionPercent));
+    } else if (rows[index].close < lowestClose) {
+      signals.push(createSignal(rows[index], 'sell', strategy, positionPercent));
+    }
+  }
+
+  return signals;
+}
+
+function buildFallbackSignals(rows, body, strategy, positionPercent) {
+  if (rows.length === 0) {
+    return [];
+  }
+
+  const requestedStart = normalizeWindow(body.current_index ?? body.start_index ?? body.observe_days ?? body.observe_bars, Math.floor(rows.length * 0.67));
+  const buyIndex = Math.min(rows.length - 1, Math.max(1, requestedStart + 1));
+  const sellIndex = Math.min(rows.length - 1, Math.max(buyIndex, buyIndex + Math.floor((rows.length - buyIndex) / 2)));
+  const signals = [createSignal(rows[buyIndex], 'buy', strategy, positionPercent)];
+
+  if (sellIndex > buyIndex) {
+    signals.push(createSignal(rows[sellIndex], 'sell', strategy, positionPercent));
+  }
+
+  return signals;
+}
+
+function buildStrategySignals(rows, body = {}) {
+  const signalParams = body.signal_params || body.parameters || {};
+  const positionPercent = normalizePositionPercent(body.position_params || {});
+  const strategy = body.signal_type || body.strategy_type || body.strategy || 'ma_cross';
+  const rawSignals = strategy === 'breakout'
+    ? buildBreakoutSignals(rows, signalParams, strategy, positionPercent)
+    : buildMaCrossSignals(rows, signalParams, strategy, positionPercent);
+  const trainStart = normalizeWindow(body.current_index ?? body.start_index ?? body.observe_days ?? body.observe_bars, Math.floor(rows.length * 0.67));
+  const trainSignals = rawSignals.filter((signal) => signal.index > trainStart);
+  const signals = trainSignals.length > 0 ? trainSignals : rawSignals;
+
+  return (signals.length > 0 ? signals : buildFallbackSignals(rows, body, strategy, positionPercent)).slice(0, 80);
+}
+
 export async function buildSimpleStrategyResult(body = {}) {
   const code = body.code || body.stock_code || body.symbol || '000001.SZ';
-  const { rows, metadata } = await getAshareKlines({ code, kind: 'stock' });
-  const recentRows = rows.slice(-260);
+  const providedRows = normalizeStrategyRows(rowsFromStrategyBody(body));
+  const marketData = providedRows.length > 0
+    ? { rows: providedRows, metadata: body.metadata || { source: 'request_kline_data' } }
+    : await getAshareKlines({ code, kind: 'stock' });
+  const recentRows = marketData.rows.slice(-Math.min(260, marketData.rows.length));
   const equityCurve = recentRows.map((row, index) => ({
     date: row.date,
-    value: Number((1 + (row.close - recentRows[0].close) / recentRows[0].close).toFixed(4)),
+    value: Number((1 + (row.close - recentRows[0].close) / (recentRows[0].close || 1)).toFixed(4)),
     close: row.close,
     index,
   }));
+  const signals = buildStrategySignals(marketData.rows, body);
 
   return {
+    signals,
     trades: [],
     equity_curve: equityCurve,
     total_return: Number((equityCurve[equityCurve.length - 1].value - 1).toFixed(4)),
     max_drawdown: 0,
-    metadata,
+    metadata: marketData.metadata,
   };
 }

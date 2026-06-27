@@ -60,6 +60,43 @@ async function verifyRoute(page, events, target, route, requiredText) {
   }
 }
 
+async function verifyFullPositionTrainingNextStep(page, events, target) {
+  const eventStart = events.length;
+  await page.goto(new URL('/full-position-training', target).toString(), { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(7000);
+
+  const strategyResponsePromise = page.waitForResponse(
+    (response) => response.url().includes('/api/run_strategy'),
+    { timeout: 20000 },
+  ).catch(() => null);
+  await page.getByRole('button', { name: '下一步' }).click();
+  const strategyResponse = await strategyResponsePromise;
+  await page.waitForTimeout(2500);
+
+  if (strategyResponse) {
+    if (!strategyResponse.ok()) {
+      throw new Error('/full-position-training next step received a failed strategy response');
+    }
+
+    const strategyPayload = await strategyResponse.json();
+    const signals = strategyPayload?.data?.signals;
+    if (!Array.isArray(signals) || signals.length === 0) {
+      throw new Error('/full-position-training strategy response has no signals');
+    }
+  }
+
+  const text = await page.locator('body').innerText();
+  if (text.includes('策略信号计算失败') || text.includes('策略信号计算出错')) {
+    throw new Error('/full-position-training next step still shows strategy signal failure');
+  }
+
+  const routeEvents = events.slice(eventStart);
+  const fatalEvents = routeEvents.filter((event) => event.includes('策略信号计算失败') || event.includes('策略信号计算出错'));
+  if (fatalEvents.length > 0) {
+    throw new Error(`/full-position-training strategy browser errors: ${fatalEvents.join(' | ')}`);
+  }
+}
+
 function waitForServer(child) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('server start timeout')), 15000);
@@ -115,6 +152,278 @@ async function verifyRealAshareData(target) {
   }
 }
 
+async function verifyStrategySignalsApi(target) {
+  const dataResponse = await fetch(new URL('/api/random_data', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      stock_code: '000001.SZ',
+      observe_days: 200,
+      train_days: 100,
+    }),
+  });
+
+  if (!dataResponse.ok) {
+    throw new Error(`strategy data request failed: HTTP ${dataResponse.status}`);
+  }
+
+  const trainingPayload = await dataResponse.json();
+  const strategyResponse = await fetch(new URL('/api/run_strategy', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      signal_type: 'ma_cross',
+      signal_params: { short_window: 5, long_window: 20 },
+      position_type: 'fixed',
+      position_params: { ratio: 0.5 },
+      observe_days: 200,
+      data: [
+        ...(Array.isArray(trainingPayload.observe_data) ? trainingPayload.observe_data : []),
+        ...(Array.isArray(trainingPayload.train_data) ? trainingPayload.train_data : []),
+      ],
+    }),
+  });
+
+  if (!strategyResponse.ok) {
+    throw new Error(`strategy signal request failed: HTTP ${strategyResponse.status}`);
+  }
+
+  const strategyPayload = await strategyResponse.json();
+  const signals = strategyPayload?.data?.signals;
+  if (!strategyPayload.success || !Array.isArray(signals) || signals.length === 0) {
+    throw new Error(`strategy signal verification failed: ${JSON.stringify({
+      success: strategyPayload.success,
+      signalRows: signals?.length,
+    })}`);
+  }
+}
+
+function buildVerificationKlines(count = 40) {
+  return Array.from({ length: count }, (_, index) => {
+    const close = Number((10 + index * 0.08 + Math.sin(index / 4) * 0.2).toFixed(4));
+    const date = `2026-04-${String((index % 28) + 1).padStart(2, '0')}`;
+    return {
+      index: index + 1,
+      time: index + 1,
+      timestamp: date,
+      date,
+      open: Number((close - 0.03).toFixed(4)),
+      high: Number((close + 0.08).toFixed(4)),
+      low: Number((close - 0.08).toFixed(4)),
+      close,
+      volume: 100000 + index * 1000,
+    };
+  });
+}
+
+async function verifyTrainingRecordPersistence(target) {
+  const phone = '13800138000';
+  const unique = Date.now();
+  const stockName = `验证股票${unique}`;
+  const klineData = buildVerificationKlines();
+  const baseRecord = {
+    phone,
+    stock_code: '000001.SZ',
+    stock_name: stockName,
+    start_time: klineData[0].timestamp,
+    end_time: klineData[klineData.length - 1].timestamp,
+    initial_capital: 100000,
+    final_capital: 108800,
+    total_profit: 8800,
+    stock_range_profit_rate: 0.052,
+    operation_profit_rate: 0.088,
+    excess_profit_rate: 0.036,
+    observe_bars: 20,
+    train_bars: 20,
+    strategy_total_profit: 6400,
+    strategy_profit_rate: 0.064,
+    mode: 'Full_Position_Training_pk',
+    trade_datas: [
+      { trade_type: 'buy', price: 10.5, amount: 1000, total_amount: 10500, kline_index: 21, profit: 0 },
+      { trade_type: 'sell', price: 11.2, amount: 1000, total_amount: 11200, kline_index: 35, profit: 700 },
+    ],
+    strategy_trades: [
+      { trade_type: 'buy', price: 10.6, amount: 1000, total_amount: 10600, kline_index: 22, profit: 0 },
+      { trade_type: 'sell', price: 11.1, amount: 1000, total_amount: 11100, kline_index: 34, profit: 500 },
+    ],
+    kline_data: klineData,
+  };
+
+  const createResponse = await fetch(new URL('/api/training-pk-sessions', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      phone,
+      stock_code: baseRecord.stock_code,
+      stock_name: baseRecord.stock_name,
+    }),
+  });
+  if (!createResponse.ok) {
+    throw new Error(`create training session failed: HTTP ${createResponse.status}`);
+  }
+
+  const createPayload = await createResponse.json();
+  const sessionCode = createPayload.session_code || createPayload.sessionCode || createPayload.data?.session_code;
+  if (!sessionCode) {
+    throw new Error(`create training session did not return session code: ${JSON.stringify(createPayload)}`);
+  }
+
+  const updateResponse = await fetch(new URL(`/api/training-pk-sessions/${encodeURIComponent(sessionCode)}`, target), {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      phone,
+      operations: [{ type: 'next', kline_index: 21 }],
+      trade_history: baseRecord.trade_datas,
+      kline_data: klineData,
+      latest_index: 35,
+    }),
+  });
+  if (!updateResponse.ok) {
+    throw new Error(`update training session failed: HTTP ${updateResponse.status}`);
+  }
+
+  const completedRecordId = `verify-session-record-${unique}`;
+  const completeResponse = await fetch(new URL(`/api/training-pk-sessions/${encodeURIComponent(sessionCode)}/complete`, target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      phone,
+      training_record: {
+        ...baseRecord,
+        record_id: completedRecordId,
+        id: completedRecordId,
+      },
+    }),
+  });
+  if (!completeResponse.ok) {
+    throw new Error(`complete training session failed: HTTP ${completeResponse.status}`);
+  }
+
+  const listResponse = await fetch(new URL(`/api/training-records?phone=${phone}&page=1&pageSize=50`, target));
+  if (!listResponse.ok) {
+    throw new Error(`training record list failed: HTTP ${listResponse.status}`);
+  }
+
+  const listPayload = await listResponse.json();
+  const listedRecords = listPayload?.data?.records || [];
+  const completedRecord = listedRecords.find((record) => record.record_id === completedRecordId);
+  if (!completedRecord) {
+    throw new Error(`completed training record not found in list: ${completedRecordId}`);
+  }
+
+  const requiredRecordFields = [
+    'final_capital',
+    'total_profit',
+    'stock_range_profit_rate',
+    'operation_profit_rate',
+    'excess_profit_rate',
+    'initial_capital',
+    'strategy_total_profit',
+    'user_trade_times',
+    'created_at',
+    'phone',
+    'stock_name',
+    'stock_code',
+    'start_time',
+    'end_time',
+    'mode',
+  ];
+  const missingFields = requiredRecordFields.filter((field) => completedRecord[field] === undefined || completedRecord[field] === null || completedRecord[field] === '');
+  if (missingFields.length > 0) {
+    throw new Error(`completed training record missing fields: ${missingFields.join(', ')}`);
+  }
+
+  const recordResponse = await fetch(new URL(`/api/lookback/training-record/${encodeURIComponent(completedRecordId)}`, target));
+  if (!recordResponse.ok) {
+    throw new Error(`lookback training record failed: HTTP ${recordResponse.status}`);
+  }
+
+  const klineResponse = await fetch(new URL(`/api/lookback/kline-data/${encodeURIComponent(completedRecordId)}`, target));
+  if (!klineResponse.ok) {
+    throw new Error(`lookback kline data failed: HTTP ${klineResponse.status}`);
+  }
+
+  const klinePayload = await klineResponse.json();
+  if (!Array.isArray(klinePayload?.data?.full_kline_data) || klinePayload.data.full_kline_data.length !== klineData.length) {
+    throw new Error(`lookback kline data invalid: ${JSON.stringify({
+      rows: klinePayload?.data?.full_kline_data?.length,
+    })}`);
+  }
+
+  const directRecordId = `verify-direct-record-${unique}`;
+  const directResponse = await fetch(new URL('/api/training-records', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      training_record: {
+        ...baseRecord,
+        record_id: directRecordId,
+        id: directRecordId,
+        stock_name: `直存股票${unique}`,
+        final_capital: 109900,
+        total_profit: 9900,
+        operation_profit_rate: 0.099,
+      },
+    }),
+  });
+  if (!directResponse.ok) {
+    throw new Error(`direct training record save failed: HTTP ${directResponse.status}`);
+  }
+
+  const directListResponse = await fetch(new URL(`/api/training-records?phone=${phone}&page=1&pageSize=50`, target));
+  const directListPayload = await directListResponse.json();
+  const directRecord = (directListPayload?.data?.records || []).find((record) => record.record_id === directRecordId);
+  if (!directRecord) {
+    throw new Error(`direct training record not found in list: ${directRecordId}`);
+  }
+
+  return {
+    completedRecordId,
+    directRecordId,
+    stockName,
+  };
+}
+
+async function verifyTradeHistoryPageShowsRecord(page, target, recordInfo) {
+  await page.goto(new URL('/trade-history', target).toString(), { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(8000);
+  const text = await page.locator('body').innerText();
+  if (!text.includes(recordInfo.stockName)) {
+    throw new Error(`/trade-history does not show completed training record: ${recordInfo.stockName}`);
+  }
+
+  if (text.includes('No data')) {
+    throw new Error('/trade-history still shows No data after saving a completed training record');
+  }
+
+  const row = page.locator('tr').filter({ hasText: recordInfo.stockName }).first();
+  await row.waitFor({ state: 'visible', timeout: 10000 });
+  const recordResponsePromise = page.waitForResponse(
+    (response) => response.url().includes(`/api/lookback/training-record/${recordInfo.completedRecordId}`),
+    { timeout: 20000 },
+  );
+  const klineResponsePromise = page.waitForResponse(
+    (response) => response.url().includes(`/api/lookback/kline-data/${recordInfo.completedRecordId}`),
+    { timeout: 20000 },
+  );
+  await row.getByRole('button', { name: '回看' }).click();
+  const [recordResponse, klineResponse] = await Promise.all([recordResponsePromise, klineResponsePromise]);
+
+  if (!recordResponse.ok() || !klineResponse.ok()) {
+    throw new Error(`/trade-history lookback failed: record=${recordResponse.status()} kline=${klineResponse.status()}`);
+  }
+
+  const [recordPayload, klinePayload] = await Promise.all([recordResponse.json(), klineResponse.json()]);
+  if (recordPayload?.data?.record_id !== recordInfo.completedRecordId) {
+    throw new Error(`/trade-history lookback record mismatch: ${JSON.stringify(recordPayload?.data)}`);
+  }
+
+  if (!Array.isArray(klinePayload?.data?.full_kline_data) || klinePayload.data.full_kline_data.length === 0) {
+    throw new Error('/trade-history lookback kline data is empty');
+  }
+}
+
 const server = spawn(process.execPath, ['server.mjs'], {
   cwd: rootDir,
   env: { ...process.env, PORT: String(port) },
@@ -124,6 +433,8 @@ const server = spawn(process.execPath, ['server.mjs'], {
 try {
   await waitForServer(server);
   await verifyRealAshareData(target);
+  await verifyStrategySignalsApi(target);
+  const trainingRecordVerification = await verifyTrainingRecordPersistence(target);
 
   const browser = await chromium.launch({ executablePath: chromePath, headless: true });
   try {
@@ -196,6 +507,9 @@ try {
     for (const [route, texts] of routeChecks) {
       await verifyRoute(page, events, target, route, texts);
     }
+
+    await verifyTradeHistoryPageShowsRecord(page, target, trainingRecordVerification);
+    await verifyFullPositionTrainingNextStep(page, events, target);
   } finally {
     await browser.close();
   }
