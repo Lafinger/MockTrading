@@ -65,6 +65,15 @@ async function verifyFullPositionTrainingNextStep(page, events, target) {
   await page.goto(new URL('/full-position-training', target).toString(), { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(7000);
 
+  await page.waitForFunction(() => {
+    const title = document.querySelector('.stock-info .top-row h2')?.textContent?.trim();
+    return Boolean(title && title !== '模拟炒股');
+  }, { timeout: 20000 });
+  const stockTitle = (await page.locator('.stock-info .top-row h2').first().innerText()).trim();
+  if (!stockTitle || stockTitle === '模拟炒股') {
+    throw new Error(`/full-position-training stock title did not show a stock name: ${stockTitle || '<empty>'}`);
+  }
+
   const strategyResponsePromise = page.waitForResponse(
     (response) => response.url().includes('/api/run_strategy'),
     { timeout: 20000 },
@@ -148,6 +157,48 @@ async function verifyRealAshareData(target) {
       totalRows,
       observeRows: payload.observe_data?.length,
       trainRows: payload.train_data?.length,
+    })}`);
+  }
+}
+
+async function verifySeniorTrainingParamsPayload(target) {
+  const response = await fetch(new URL('/api/random_data', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      mode: 'senior_pk',
+      observe_days: 100,
+      train_days: 50,
+      stock_type: '60',
+      leverage_enabled: 'false',
+      commission_enabled: 'true',
+      buy_commission_rate: '0.0003',
+      sell_commission_rate: '0.0003',
+      min_commission: '5',
+      stamp_duty_rate: '0.0005',
+      transfer_fee_rate: '0.00002',
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`senior training params data request failed: HTTP ${response.status}`);
+  }
+
+  const text = await response.text();
+  const payloadBytes = Buffer.byteLength(text, 'utf8');
+  const payload = JSON.parse(text);
+  const hasTrainingRows = Array.isArray(payload.observe_data) && payload.observe_data.length === 100 &&
+    Array.isArray(payload.train_data) && payload.train_data.length === 50;
+  const isRequestedStockType = /^60\d{4}\.SH$/.test(payload.stock_code);
+
+  if (!payload.success || !hasTrainingRows || !isRequestedStockType || !payload.stock_name || payloadBytes > 1_000_000) {
+    throw new Error(`senior training params payload verification failed: ${JSON.stringify({
+      success: payload.success,
+      stockCode: payload.stock_code,
+      stockName: payload.stock_name,
+      observeRows: payload.observe_data?.length,
+      trainRows: payload.train_data?.length,
+      payloadBytes,
     })}`);
   }
 }
@@ -424,6 +475,32 @@ async function verifyTradeHistoryPageShowsRecord(page, target, recordInfo) {
   }
 }
 
+async function verifySeniorTrainingParamsCanEnter(page, events, target) {
+  const eventStart = events.length;
+  await page.goto(new URL('/senior_training_pk/params', target).toString(), { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(1000);
+  await page.getByRole('button', { name: '确定' }).click();
+  await page.waitForURL('**/senior_training_pk/training_pk**', { timeout: 30000 });
+  await page.waitForTimeout(3000);
+
+  const text = await page.locator('body').innerText();
+  if (text.includes('请求失败') || text.includes('股票数据加载失败')) {
+    throw new Error('/senior_training_pk/params failed to enter training page');
+  }
+
+  const routeEvents = events.slice(eventStart);
+  const fatalEvents = routeEvents.filter((event) => (
+    event.startsWith('pageerror:') ||
+    event.includes('QuotaExceededError') ||
+    event.includes('请求失败') ||
+    event.includes('股票数据加载失败')
+  ));
+
+  if (fatalEvents.length > 0) {
+    throw new Error(`/senior_training_pk/params browser errors: ${fatalEvents.join(' | ')}`);
+  }
+}
+
 const server = spawn(process.execPath, ['server.mjs'], {
   cwd: rootDir,
   env: { ...process.env, PORT: String(port) },
@@ -433,6 +510,7 @@ const server = spawn(process.execPath, ['server.mjs'], {
 try {
   await waitForServer(server);
   await verifyRealAshareData(target);
+  await verifySeniorTrainingParamsPayload(target);
   await verifyStrategySignalsApi(target);
   const trainingRecordVerification = await verifyTrainingRecordPersistence(target);
 
@@ -494,7 +572,7 @@ try {
       ['/pattern-search', ['AI画图选股搜索', '历史记录']],
       ['/quant-flow', ['量化策略回测', '选择标的']],
       ['/ai-stock-analysis', ['AI股票分析', '快速分析']],
-      ['/full-position-training', ['模拟炒股', '可用虚拟资金']],
+      ['/full-position-training', ['可用虚拟资金']],
       ['/futures-trading-plus/params', ['商品期货（排位）', '期货品种']],
       ['/virtual_exchange/trade', ['K线', '盘口', '最近成交']],
       ['/virtual_exchange/assets', ['总资产', '持有资产']],
@@ -509,6 +587,7 @@ try {
     }
 
     await verifyTradeHistoryPageShowsRecord(page, target, trainingRecordVerification);
+    await verifySeniorTrainingParamsCanEnter(page, events, target);
     await verifyFullPositionTrainingNextStep(page, events, target);
   } finally {
     await browser.close();

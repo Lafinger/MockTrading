@@ -22,6 +22,32 @@ const defaultStocks = [
   { code: '601318.SH', name: '中国平安', quoteId: '1.601318' },
 ];
 
+const stockTypeFallbacks = {
+  60: [
+    { code: '600000.SH', name: '浦发银行', quoteId: '1.600000' },
+    { code: '600036.SH', name: '招商银行', quoteId: '1.600036' },
+    { code: '600519.SH', name: '贵州茅台', quoteId: '1.600519' },
+    { code: '601318.SH', name: '中国平安', quoteId: '1.601318' },
+  ],
+  '00': [
+    { code: '000001.SZ', name: '平安银行', quoteId: '0.000001' },
+    { code: '000002.SZ', name: '万科A', quoteId: '0.000002' },
+    { code: '000858.SZ', name: '五粮液', quoteId: '0.000858' },
+  ],
+  30: [
+    { code: '300059.SZ', name: '东方财富', quoteId: '0.300059' },
+    { code: '300750.SZ', name: '宁德时代', quoteId: '0.300750' },
+  ],
+  68: [
+    { code: '688981.SH', name: '中芯国际', quoteId: '1.688981' },
+    { code: '688599.SH', name: '天合光能', quoteId: '1.688599' },
+  ],
+  92: [
+    { code: '920002.BJ', name: '万达轴承', quoteId: '0.920002' },
+    { code: '920116.BJ', name: '星图测控', quoteId: '0.920116' },
+  ],
+};
+
 const defaultEtfs = [
   { code: '510300.SH', name: '沪深300ETF', quoteId: '1.510300' },
   { code: '510050.SH', name: '上证50ETF', quoteId: '1.510050' },
@@ -160,6 +186,76 @@ function codeFromQuoteId(quoteId, name = '') {
     name,
     quoteId,
   };
+}
+
+function normalizeStockType(value = '') {
+  const text = String(value || '').trim();
+  if (text === 'random') {
+    return 'random';
+  }
+
+  if (['60', '00', '30', '68', '92'].includes(text)) {
+    return text;
+  }
+
+  return '';
+}
+
+function stockTypeFs(stockType) {
+  const normalized = normalizeStockType(stockType);
+  if (normalized === '60') {
+    return 'm:1+t:2,m:1+t:23';
+  }
+
+  if (normalized === '00') {
+    return 'm:0+t:6';
+  }
+
+  if (normalized === '30') {
+    return 'm:0+t:80';
+  }
+
+  if (normalized === '68') {
+    return 'm:1+t:23';
+  }
+
+  if (normalized === '92') {
+    return 'm:0+t:81';
+  }
+
+  return 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81';
+}
+
+function codeMatchesStockType(code = '', stockType = '') {
+  const normalized = normalizeStockType(stockType);
+  if (!normalized || normalized === 'random') {
+    return true;
+  }
+
+  return String(code).startsWith(normalized);
+}
+
+function pickRandomItem(items = []) {
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+async function resolveRandomStockByType(stockType = '') {
+  const normalized = normalizeStockType(stockType);
+  const fallbackPool = normalized && normalized !== 'random'
+    ? stockTypeFallbacks[normalized] || defaultStocks
+    : Object.values(stockTypeFallbacks).flat();
+
+  try {
+    const list = await getAshareMarketList('stock', 200, stockTypeFs(normalized));
+    const candidates = list.filter((item) => codeMatchesStockType(item.code, normalized));
+    if (candidates.length > 0) {
+      return pickRandomItem(candidates);
+    }
+  } catch {
+    // Use the local fallback pool when the market list endpoint is unavailable.
+  }
+
+  return pickRandomItem(fallbackPool);
 }
 
 function adjustFlag() {
@@ -307,32 +403,45 @@ export async function getAshareKlines({
 }
 
 export async function buildAshareTrainingPayload({ body = {}, searchParams = new URLSearchParams(), kind = 'stock' } = {}) {
-  const asset = assetFromRequest({ body, searchParams, kind });
   const begin = body.begin || body.start || body.start_date || searchParams.get('begin') || searchParams.get('start_date') || '19900101';
   const end = body.end || body.end_date || searchParams.get('end') || searchParams.get('end_date') || '20500101';
   const observeCount = Number(body.observe_days || body.observe_bars || searchParams.get('observe_days') || searchParams.get('observe_bars') || 200);
   const trainCount = Number(body.train_days || body.train_bars || searchParams.get('train_days') || searchParams.get('train_bars') || 100);
+  const explicitCode = body.stock_code || body.stockCode || body.symbol || body.code || body.asset_code ||
+    searchParams.get('stock_code') || searchParams.get('stockCode') || searchParams.get('symbol') ||
+    searchParams.get('code') || searchParams.get('asset_code');
+  const isSeniorParamsRequest = String(body.mode || searchParams.get('mode') || '') === 'senior_pk' && !explicitCode;
+  const stockType = body.stock_type || body.stockType || searchParams.get('stock_type') || searchParams.get('stockType');
+  const asset = isSeniorParamsRequest && kind === 'stock'
+    ? await resolveRandomStockByType(stockType)
+    : assetFromRequest({ body, searchParams, kind });
   const { asset: resolvedAsset, rows, metadata } = await getAshareKlines({ code: asset.code, kind, begin, end });
-  const segmentSize = Math.min(rows.length, Math.max(1, observeCount + trainCount));
-  const segment = rows.slice(-segmentSize);
-  const observeData = segment.slice(0, Math.min(observeCount, segment.length));
-  const trainData = segment.slice(observeData.length);
   const stockInfo = {
     code: resolvedAsset.code,
     name: resolvedAsset.name,
     stock_code: resolvedAsset.code,
     stock_name: resolvedAsset.name,
   };
+  const rowsWithStockInfo = rows.map((row) => ({
+    ...row,
+    stock_code: stockInfo.stock_code,
+    stock_name: stockInfo.stock_name,
+  }));
+  const segmentSize = Math.min(rowsWithStockInfo.length, Math.max(1, observeCount + trainCount));
+  const segment = rowsWithStockInfo.slice(-segmentSize);
+  const observeData = segment.slice(0, Math.min(observeCount, segment.length));
+  const trainData = segment.slice(observeData.length);
+  const responseRows = isSeniorParamsRequest ? segment : rowsWithStockInfo;
 
   return {
     success: true,
     source: metadata.source,
     data_source: metadata.source_name,
     metadata,
-    data: rows,
-    stock_data: rows,
-    stockData: rows,
-    kline_data: rows,
+    data: responseRows,
+    stock_data: responseRows,
+    stockData: responseRows,
+    kline_data: responseRows,
     current_stock: stockInfo,
     stock: stockInfo,
     stock_info: stockInfo,
@@ -397,10 +506,10 @@ export async function searchAshareAssets(keyword = '', kind = 'stock', limit = 1
     .slice(0, limit);
 }
 
-export async function getAshareMarketList(kind = 'stock', limit = 20) {
-  const fs = kind === 'etf'
+export async function getAshareMarketList(kind = 'stock', limit = 20, fsOverride = '') {
+  const fs = fsOverride || (kind === 'etf'
     ? 'b:MK0021,b:MK0022,b:MK0023,b:MK0024'
-    : 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23';
+    : 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23');
   const url = new URL('/api/qt/clist/get', eastmoneyQuoteOrigin);
   url.searchParams.set('pn', '1');
   url.searchParams.set('pz', String(limit));
