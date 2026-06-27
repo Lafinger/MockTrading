@@ -1,7 +1,10 @@
 import { createServer } from 'node:http';
-import { createReadStream } from 'node:fs';
+import { createReadStream, mkdirSync } from 'node:fs';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { networkInterfaces } from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import {
   buildAshareTrainingPayload,
@@ -18,10 +21,55 @@ const rootDir = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(rootDir, 'public');
 const cacheDir = path.join(rootDir, '.losergod-cache');
 const trainingStorePath = path.join(cacheDir, 'training-records.json');
+const sqliteDbPath = path.join(cacheDir, 'losergod.sqlite');
 const port = Number(process.env.PORT || 5173);
+const host = process.env.HOST || '0.0.0.0';
 const apiMode = process.env.LOSERGOD_API || 'mock';
 const upstreamOrigin = 'https://www.losergod.com';
-const sessions = new Map();
+
+mkdirSync(cacheDir, { recursive: true });
+const localDb = new DatabaseSync(sqliteDbPath);
+localDb.exec(`
+  PRAGMA journal_mode = WAL;
+  CREATE TABLE IF NOT EXISTS users (
+    phone TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    password_salt TEXT NOT NULL,
+    profile_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS auth_sessions (
+    token TEXT PRIMARY KEY,
+    phone TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS training_records (
+    record_id TEXT PRIMARY KEY,
+    phone TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_training_records_phone_created_at
+    ON training_records(phone, created_at DESC);
+  CREATE TABLE IF NOT EXISTS training_sessions (
+    session_code TEXT PRIMARY KEY,
+    phone TEXT NOT NULL,
+    session_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_training_sessions_phone_updated_at
+    ON training_sessions(phone, updated_at DESC);
+  CREATE TABLE IF NOT EXISTS kline_lookbacks (
+    record_id TEXT PRIMARY KEY,
+    phone TEXT NOT NULL,
+    kline_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+`);
 
 const mimeTypes = new Map([
   ['.html', 'text/html; charset=utf-8'],
@@ -51,9 +99,9 @@ function sendJson(res, status, payload) {
 
 function createUserProfile(phone = '13800138000') {
   return {
-    _id: 'local-user-001',
-    user_id: 'local-user-001',
-    public_id: 'LG-LOCAL-001',
+    _id: `local-user-${phone}`,
+    user_id: `local-user-${phone}`,
+    public_id: `LG-${phone}`,
     phone,
     username: '本地用户',
     userName: '本地用户',
@@ -90,6 +138,103 @@ function createUserProfile(phone = '13800138000') {
   };
 }
 
+function hashPassword(password, salt = randomBytes(16).toString('hex')) {
+  const hash = scryptSync(String(password || ''), salt, 64).toString('hex');
+  return { salt, hash };
+}
+
+function verifyPassword(password, salt, expectedHash) {
+  const actual = Buffer.from(hashPassword(password, salt).hash, 'hex');
+  const expected = Buffer.from(String(expectedHash || ''), 'hex');
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function createAuthToken(phone) {
+  const token = `local-token-${phone}-${randomBytes(18).toString('hex')}`;
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  localDb.prepare(`
+    INSERT INTO auth_sessions (token, phone, created_at, expires_at)
+    VALUES (?, ?, ?, ?)
+  `).run(token, phone, now.toISOString(), expiresAt);
+  return token;
+}
+
+function getUserRow(phone) {
+  return localDb.prepare('SELECT * FROM users WHERE phone = ?').get(String(phone || '')) || null;
+}
+
+function parseJsonValue(value, fallback = null) {
+  try {
+    return value ? JSON.parse(value) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function getUserProfileByPhone(phone) {
+  const row = getUserRow(phone);
+  return row ? parseJsonValue(row.profile_json, createUserProfile(phone)) : null;
+}
+
+function saveUserProfile(profile) {
+  localDb.prepare(`
+    UPDATE users
+    SET profile_json = ?, updated_at = ?
+    WHERE phone = ?
+  `).run(JSON.stringify(profile), new Date().toISOString(), profile.phone);
+}
+
+function syncUserCapitalFromTrainingRecord(profile, record) {
+  const finalCapital = Number(record.final_capital ?? record.final_assets);
+  if (!Number.isFinite(finalCapital) || finalCapital < 0) {
+    return profile;
+  }
+
+  const updatedProfile = {
+    ...profile,
+    total_capital: finalCapital,
+    available_capital: finalCapital,
+    stock_market_value: 0,
+  };
+  saveUserProfile(updatedProfile);
+  return updatedProfile;
+}
+
+function createUser(phone, password) {
+  const normalizedPhone = stringOr(phone);
+  if (!normalizedPhone || !password) {
+    return { ok: false, status: 400, code: 'INVALID_REQUEST', message: '手机号和密码不能为空' };
+  }
+
+  if (getUserRow(normalizedPhone)) {
+    return { ok: false, status: 409, code: 'USER_ALREADY_EXISTS', message: '该手机号已注册，请直接登录' };
+  }
+
+  const now = new Date().toISOString();
+  const { salt, hash } = hashPassword(password);
+  const profile = createUserProfile(normalizedPhone);
+  localDb.prepare(`
+    INSERT INTO users (phone, password_hash, password_salt, profile_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(normalizedPhone, hash, salt, JSON.stringify(profile), now, now);
+
+  return { ok: true, profile };
+}
+
+function authenticateUser(phone, password) {
+  const row = getUserRow(phone);
+  if (!row) {
+    return { ok: false, status: 401, code: 'USER_NOT_FOUND', message: '账号没有注册，请先注册' };
+  }
+
+  if (!verifyPassword(password, row.password_salt, row.password_hash)) {
+    return { ok: false, status: 401, code: 'INVALID_PASSWORD', message: '账号密码错误，请重新输入' };
+  }
+
+  return { ok: true, profile: parseJsonValue(row.profile_json, createUserProfile(phone)) };
+}
+
 function readRequestBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -112,10 +257,39 @@ async function readJsonBody(req) {
   }
 }
 
-function getSessionProfile(req) {
+function getAuthToken(req) {
   const authorization = req.headers.authorization || '';
-  const token = authorization.replace(/^Bearer\s+/i, '');
-  return sessions.get(token) || createUserProfile();
+  return authorization.replace(/^Bearer\s+/i, '').trim();
+}
+
+function getSessionProfile(req) {
+  const token = getAuthToken(req);
+  if (!token) {
+    return null;
+  }
+
+  const row = localDb.prepare(`
+    SELECT auth_sessions.phone, users.profile_json
+    FROM auth_sessions
+    JOIN users ON users.phone = auth_sessions.phone
+    WHERE auth_sessions.token = ? AND auth_sessions.expires_at > ?
+  `).get(token, new Date().toISOString());
+
+  return row ? parseJsonValue(row.profile_json, createUserProfile(row.phone)) : null;
+}
+
+function requireSessionProfile(req, res) {
+  const profile = getSessionProfile(req);
+  if (!profile) {
+    sendJson(res, 401, {
+      success: false,
+      code: 'UNAUTHORIZED',
+      message: '请先登录',
+    });
+    return null;
+  }
+
+  return profile;
 }
 
 function getVipStatus(profile = createUserProfile()) {
@@ -152,7 +326,7 @@ function getPortfolioRows() {
     {
       portfolio_id: 'local-beta',
       name: '趋势突破组合',
-      username: '逆神训练员',
+      username: 'Lafinger训练员',
       net_value: 1.7562,
       return_1d: -0.0035,
       return_1m: 0.1108,
@@ -332,6 +506,19 @@ function normalizeKlineRows(rows = []) {
   }));
 }
 
+function normalizeTrainingMode(rawMode = '') {
+  const mode = stringOr(rawMode, 'stock');
+  if (mode === 'Full_Position_Training_pk' || mode === 'full_position' || mode === 'full-position') {
+    return 'full_position';
+  }
+
+  if (mode === 'senior_pk' || mode === 'senior_training_pk_records') {
+    return 'senior_pk';
+  }
+
+  return mode;
+}
+
 function createTrainingRecord(rawRecord = {}, session = {}) {
   const now = new Date().toISOString();
   const klineRows = normalizeKlineRows(rawRecord.kline_data || rawRecord.full_kline_data || session.kline_data || []);
@@ -350,7 +537,7 @@ function createTrainingRecord(rawRecord = {}, session = {}) {
   const startTime = stringOr(rawRecord.start_time, firstKlineTimestamp(klineRows) || '2026-01-02');
   const endTime = stringOr(rawRecord.end_time, lastKlineTimestamp(klineRows) || now);
   const rawMode = stringOr(rawRecord.mode || rawRecord.index_mode || session.mode, 'stock');
-  const mode = rawMode === 'Full_Position_Training_pk' ? 'full_position' : rawMode;
+  const mode = normalizeTrainingMode(rawMode);
   const tradeDatas = normalizeTradeItems(rawRecord.trade_datas || rawRecord.trade_data || rawRecord.trades || session.trade_history || []);
   const strategyTrades = normalizeTradeItems(rawRecord.strategy_trades || rawRecord.strategyTrades || []);
   const sessionKey = stringOr(rawRecord.sessionKey || rawRecord.session_key || session.session_code || session.sessionCode, recordId);
@@ -426,23 +613,32 @@ function createKlineLookbackData(record, rawRecord = {}, session = {}) {
 }
 
 async function saveTrainingRecord(rawRecord = {}, session = {}) {
-  const store = await readTrainingStore();
   const record = createTrainingRecord(rawRecord, session);
   const klineData = createKlineLookbackData(record, rawRecord, session);
-  const existingIndex = store.records.findIndex((item) => (
-    item.record_id === record.record_id ||
-    item.session_key && item.session_key === record.session_key
-  ));
-
-  if (existingIndex >= 0) {
-    store.records[existingIndex] = { ...store.records[existingIndex], ...record };
-  } else {
-    store.records.unshift(record);
-  }
-
-  store.klineData[record.record_id] = klineData;
-  await writeTrainingStore(store);
-  return { record, klineData, store };
+  localDb.prepare(`
+    INSERT INTO training_records (record_id, phone, record_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(record_id) DO UPDATE SET
+      phone = excluded.phone,
+      record_json = excluded.record_json,
+      created_at = excluded.created_at,
+      updated_at = excluded.updated_at
+  `).run(
+    record.record_id,
+    record.phone,
+    JSON.stringify(record),
+    record.created_at,
+    record.updated_at,
+  );
+  localDb.prepare(`
+    INSERT INTO kline_lookbacks (record_id, phone, kline_json, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(record_id) DO UPDATE SET
+      phone = excluded.phone,
+      kline_json = excluded.kline_json,
+      updated_at = excluded.updated_at
+  `).run(record.record_id, record.phone, JSON.stringify(klineData), new Date().toISOString());
+  return { record, klineData };
 }
 
 function getTrainingModeAliases(mode) {
@@ -453,11 +649,21 @@ function getTrainingModeAliases(mode) {
     aliases.add('full-position');
   }
 
+  if (mode === 'senior_pk' || mode === 'senior_training_pk_records') {
+    aliases.add('senior_pk');
+    aliases.add('senior_training_pk_records');
+  }
+
   return aliases;
 }
 
-function filterTrainingRecords(records, requestUrl) {
-  const phone = requestUrl.searchParams.get('phone') || requestUrl.searchParams.get('user_id') || '';
+function requestModeFromHeaders(req) {
+  const value = req.headers['x-mode'];
+  return Array.isArray(value) ? value[0] : stringOr(value);
+}
+
+function filterTrainingRecords(records, requestUrl, ownerPhone = '') {
+  const phone = ownerPhone || requestUrl.searchParams.get('phone') || requestUrl.searchParams.get('user_id') || '';
   const modes = (requestUrl.searchParams.get('modes') || '')
     .split(',')
     .map((item) => item.trim())
@@ -482,10 +688,31 @@ function filterTrainingRecords(records, requestUrl) {
   });
 }
 
-async function getAllTrainingRecords() {
+function getStoredTrainingRecords(phone) {
+  const rows = localDb.prepare(`
+    SELECT record_json
+    FROM training_records
+    WHERE phone = ?
+    ORDER BY created_at DESC
+  `).all(phone);
+  return rows.map((row) => createTrainingRecord(parseJsonValue(row.record_json, {})));
+}
+
+async function getLegacyTrainingRecords(phone) {
   const store = await readTrainingStore();
   const recordsById = new Map();
-  for (const record of [...store.records, ...getSeedTrainingRecords()]) {
+  for (const record of store.records) {
+    if (record.phone === phone || record.user_id === phone) {
+      recordsById.set(record.record_id || record.id, createTrainingRecord(record));
+    }
+  }
+
+  return Array.from(recordsById.values());
+}
+
+async function getAllTrainingRecords(phone) {
+  const recordsById = new Map();
+  for (const record of [...getStoredTrainingRecords(phone), ...await getLegacyTrainingRecords(phone)]) {
     recordsById.set(record.record_id || record.id, createTrainingRecord(record));
   }
 
@@ -495,12 +722,31 @@ async function getAllTrainingRecords() {
 async function handleTrainingRecordsApi(req, res, requestUrl) {
   if (req.method === 'POST') {
     const body = await readJsonBody(req);
-    const rawRecord = body.training_record || body.record || body;
-    const { record } = await saveTrainingRecord(rawRecord);
+    const bodyRecord = body.training_record || body.record || body;
+    const sessionProfile = getSessionProfile(req);
+    const recordPhone = stringOr(bodyRecord.phone || bodyRecord.user_id || bodyRecord.userId);
+    const ownerPhone = sessionProfile?.phone || recordPhone;
+    if (!ownerPhone) {
+      sendJson(res, 401, { success: false, code: 'UNAUTHORIZED', message: '请先登录' });
+      return true;
+    }
+
+    const profile = sessionProfile || getUserProfileByPhone(ownerPhone) || createUserProfile(ownerPhone);
+    const requestMode = stringOr(bodyRecord.mode || bodyRecord.index_mode || requestModeFromHeaders(req));
+    const rawRecord = {
+      ...bodyRecord,
+      ...(requestMode ? { mode: requestMode } : {}),
+      source_mode: bodyRecord.source_mode || requestMode || bodyRecord.mode,
+      phone: ownerPhone,
+      user_id: profile.user_id || profile.phone,
+    };
+    const { record } = await saveTrainingRecord(rawRecord, { phone: ownerPhone });
+    const updatedProfile = syncUserCapitalFromTrainingRecord(profile, record);
     sendJson(res, 200, {
       success: true,
       message: '训练记录保存成功',
       data: record,
+      profile: updatedProfile,
       record,
       record_id: record.record_id,
       id: record.id,
@@ -508,9 +754,17 @@ async function handleTrainingRecordsApi(req, res, requestUrl) {
     return true;
   }
 
+  const profile = getSessionProfile(req);
+  const queryPhone = requestUrl.searchParams.get('phone') || requestUrl.searchParams.get('user_id') || '';
+  const ownerPhone = profile?.phone || queryPhone;
+  if (!ownerPhone) {
+    sendJson(res, 401, { success: false, code: 'UNAUTHORIZED', message: '请先登录' });
+    return true;
+  }
+
   const page = Math.max(1, numberOr(requestUrl.searchParams.get('page'), 1));
   const pageSize = Math.max(1, numberOr(requestUrl.searchParams.get('pageSize') || requestUrl.searchParams.get('limit'), 20));
-  const records = filterTrainingRecords(await getAllTrainingRecords(), requestUrl);
+  const records = filterTrainingRecords(await getAllTrainingRecords(ownerPhone), requestUrl, ownerPhone);
   const start = (page - 1) * pageSize;
   const pageRecords = records.slice(start, start + pageSize);
 
@@ -532,14 +786,53 @@ async function handleTrainingRecordsApi(req, res, requestUrl) {
   return true;
 }
 
+function saveTrainingSession(session) {
+  localDb.prepare(`
+    INSERT INTO training_sessions (session_code, phone, session_json, status, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(session_code) DO UPDATE SET
+      phone = excluded.phone,
+      session_json = excluded.session_json,
+      status = excluded.status,
+      updated_at = excluded.updated_at
+  `).run(
+    session.session_code,
+    session.phone,
+    JSON.stringify(session),
+    session.status || 'active',
+    session.updated_at || new Date().toISOString(),
+  );
+}
+
+function getTrainingSession(sessionCode, phone) {
+  const row = localDb.prepare(`
+    SELECT session_json
+    FROM training_sessions
+    WHERE session_code = ? AND phone = ?
+  `).get(sessionCode, phone);
+  return row ? parseJsonValue(row.session_json, null) : null;
+}
+
+function getTrainingSessions(phone) {
+  const rows = localDb.prepare(`
+    SELECT session_json
+    FROM training_sessions
+    WHERE phone = ?
+    ORDER BY updated_at DESC
+  `).all(phone);
+  return rows.map((row) => parseJsonValue(row.session_json, null)).filter(Boolean);
+}
+
 async function handleTrainingPkSessionsApi(req, res, requestUrl) {
   const pathname = requestUrl.pathname;
-  const store = await readTrainingStore();
+  const profile = requireSessionProfile(req, res);
+  if (!profile) {
+    return true;
+  }
 
   if (pathname === '/api/training-pk-sessions/check' || pathname === '/api/training-pk-sessions/check-latest-index') {
-    const phone = requestUrl.searchParams.get('phone') || '13800138000';
-    const latestSession = Object.values(store.sessions)
-      .filter((session) => session.phone === phone && session.status !== 'completed')
+    const latestSession = getTrainingSessions(profile.phone)
+      .filter((session) => session.status !== 'completed')
       .sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))[0] || null;
     sendJson(res, 200, {
       success: true,
@@ -561,7 +854,7 @@ async function handleTrainingPkSessionsApi(req, res, requestUrl) {
     const session = {
       session_code: sessionCode,
       sessionCode,
-      phone: stringOr(body.phone, '13800138000'),
+      phone: profile.phone,
       stock_code: stringOr(body.stock_code || body.code, '000001.SZ'),
       stock_name: stringOr(body.stock_name || body.name, body.stock_code || '000001.SZ'),
       mode: stringOr(body.mode, 'Full_Position_Training_pk'),
@@ -573,8 +866,7 @@ async function handleTrainingPkSessionsApi(req, res, requestUrl) {
       created_at: now,
       updated_at: now,
     };
-    store.sessions[sessionCode] = session;
-    await writeTrainingStore(store);
+    saveTrainingSession(session);
     sendJson(res, 200, {
       success: true,
       message: '会话创建成功',
@@ -587,7 +879,7 @@ async function handleTrainingPkSessionsApi(req, res, requestUrl) {
   }
 
   if (pathname === '/api/training-pk-sessions' && req.method === 'GET') {
-    const sessionsList = Object.values(store.sessions);
+    const sessionsList = getTrainingSessions(profile.phone);
     sendJson(res, 200, { success: true, data: sessionsList, list: sessionsList, total: sessionsList.length });
     return true;
   }
@@ -599,20 +891,11 @@ async function handleTrainingPkSessionsApi(req, res, requestUrl) {
 
   const sessionCode = decodeURIComponent(match[1]);
   const action = match[2] || '';
-  const session = store.sessions[sessionCode] || {
-    session_code: sessionCode,
-    sessionCode: sessionCode,
-    phone: requestUrl.searchParams.get('phone') || '13800138000',
-    stock_code: '000001.SZ',
-    stock_name: '000001.SZ',
-    mode: 'Full_Position_Training_pk',
-    status: 'active',
-    operations: [],
-    trade_history: [],
-    kline_data: [],
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-  };
+  const session = getTrainingSession(sessionCode, profile.phone);
+  if (!session) {
+    sendJson(res, 404, { success: false, message: '排位训练会话不存在' });
+    return true;
+  }
 
   if (req.method === 'GET') {
     sendJson(res, 200, { success: true, data: session, session });
@@ -623,15 +906,14 @@ async function handleTrainingPkSessionsApi(req, res, requestUrl) {
     const body = await readJsonBody(req);
     const updatedSession = {
       ...session,
-      phone: stringOr(body.phone || session.phone, '13800138000'),
+      phone: profile.phone,
       operations: Array.isArray(body.operations) ? body.operations : session.operations,
       trade_history: Array.isArray(body.trade_history) ? body.trade_history : session.trade_history,
       kline_data: Array.isArray(body.kline_data) ? body.kline_data : session.kline_data,
       latest_index: numberOr(body.current_index ?? body.latest_index, session.latest_index || 0),
       updated_at: new Date().toISOString(),
     };
-    store.sessions[sessionCode] = updatedSession;
-    await writeTrainingStore(store);
+    saveTrainingSession(updatedSession);
     sendJson(res, 200, { success: true, message: '会话更新成功', data: updatedSession, session: updatedSession });
     return true;
   }
@@ -641,13 +923,14 @@ async function handleTrainingPkSessionsApi(req, res, requestUrl) {
     const rawRecord = body.training_record || body.record || {};
     const completedSession = {
       ...session,
-      phone: stringOr(body.phone || rawRecord.phone || session.phone, '13800138000'),
+      phone: profile.phone,
       status: 'completed',
       updated_at: new Date().toISOString(),
     };
     const recordInput = {
       ...rawRecord,
-      phone: completedSession.phone,
+      phone: profile.phone,
+      user_id: profile.user_id || profile.phone,
       stock_code: rawRecord.stock_code || completedSession.stock_code,
       stock_name: rawRecord.stock_name || completedSession.stock_name,
       kline_data: rawRecord.kline_data || completedSession.kline_data,
@@ -656,21 +939,15 @@ async function handleTrainingPkSessionsApi(req, res, requestUrl) {
       sessionKey: sessionCode,
     };
     const { record, klineData } = await saveTrainingRecord(recordInput, completedSession);
+    const updatedProfile = syncUserCapitalFromTrainingRecord(profile, record);
     completedSession.record_id = record.record_id;
     completedSession.kline_data = klineData.full_kline_data;
-    store.sessions[sessionCode] = completedSession;
-    store.klineData[record.record_id] = klineData;
-    const recordIndex = store.records.findIndex((item) => item.record_id === record.record_id);
-    if (recordIndex >= 0) {
-      store.records[recordIndex] = record;
-    } else {
-      store.records.unshift(record);
-    }
-    await writeTrainingStore(store);
+    saveTrainingSession(completedSession);
     sendJson(res, 200, {
       success: true,
       message: 'PK记录保存成功',
       data: record,
+      profile: updatedProfile,
       record,
       record_id: record.record_id,
       session_code: sessionCode,
@@ -688,12 +965,33 @@ async function handleLookbackApi(req, res, requestUrl) {
     return false;
   }
 
+  const profile = getSessionProfile(req);
+  const hasToken = Boolean(getAuthToken(req));
+
   const recordId = decodeURIComponent((recordMatch || klineMatch)[1]);
-  const store = await readTrainingStore();
-  const record = [...store.records, ...getSeedTrainingRecords()].find((item) => item.record_id === recordId || item.id === recordId);
+  const storedRecordRow = profile
+    ? localDb.prepare(`
+      SELECT record_json
+      FROM training_records
+      WHERE record_id = ? AND phone = ?
+    `).get(recordId, profile.phone)
+    : localDb.prepare(`
+      SELECT record_json
+      FROM training_records
+      WHERE record_id = ?
+    `).get(recordId);
+  let record = storedRecordRow ? parseJsonValue(storedRecordRow.record_json, null) : null;
+  let legacyStore = null;
+  if (!record) {
+    legacyStore = await readTrainingStore();
+    record = legacyStore.records.find((item) => (
+      (item.record_id === recordId || item.id === recordId) &&
+      (!profile || item.phone === profile.phone || item.user_id === profile.phone)
+    ));
+  }
 
   if (!record) {
-    sendJson(res, 404, { success: false, message: '训练记录不存在' });
+    sendJson(res, hasToken ? 404 : 401, { success: false, message: hasToken ? '训练记录不存在' : '请先登录' });
     return true;
   }
 
@@ -702,9 +1000,24 @@ async function handleLookbackApi(req, res, requestUrl) {
     return true;
   }
 
+  const normalizedRecord = createTrainingRecord(record);
+  const klineRow = profile
+    ? localDb.prepare(`
+      SELECT kline_json
+      FROM kline_lookbacks
+      WHERE record_id = ? AND phone = ?
+    `).get(normalizedRecord.record_id, profile.phone)
+    : localDb.prepare(`
+      SELECT kline_json
+      FROM kline_lookbacks
+      WHERE record_id = ?
+    `).get(normalizedRecord.record_id);
+
   sendJson(res, 200, {
     success: true,
-    data: store.klineData[record.record_id] || createKlineLookbackData(createTrainingRecord(record), record),
+    data: klineRow
+      ? parseJsonValue(klineRow.kline_json, createKlineLookbackData(normalizedRecord, record))
+      : legacyStore?.klineData?.[normalizedRecord.record_id] || createKlineLookbackData(normalizedRecord, record),
   });
   return true;
 }
@@ -865,7 +1178,7 @@ function getVirtualCoins() {
       symbol: 'LGD/USDT',
       coin_symbol: 'LGD',
       base_symbol: 'USDT',
-      name: '逆神币',
+      name: 'Lafinger币',
       init_price: 12.35,
       base_scale: 4,
       min_volume: 1,
@@ -964,29 +1277,63 @@ async function handleMockApi(req, res, requestUrl) {
     return true;
   }
 
-  if (pathname === '/api/auth/login' || pathname === '/api/auth/register') {
+  if (pathname === '/api/health') {
+    sendJson(res, 200, { success: true, status: 'ok' });
+    return true;
+  }
+
+  if (pathname === '/api/auth/register') {
     const body = await readJsonBody(req);
-    const phone = body.phone || '13800138000';
-    const token = `local-token-${phone}-${Date.now()}`;
-    const profile = createUserProfile(phone);
-    sessions.set(token, profile);
+    const result = createUser(body.phone, body.password);
+    if (!result.ok) {
+      sendJson(res, result.status, { success: false, code: result.code, message: result.message });
+      return true;
+    }
+
+    const token = createAuthToken(result.profile.phone);
     sendJson(res, 200, {
       success: true,
-      message: pathname.endsWith('/register') ? '注册成功' : '登录成功',
+      message: '注册成功',
       token,
-      user_info: profile,
-      data: { token, user_info: profile },
+      user_info: result.profile,
+      data: { token, user_info: result.profile },
+    });
+    return true;
+  }
+
+  if (pathname === '/api/auth/login') {
+    const body = await readJsonBody(req);
+    const result = authenticateUser(body.phone, body.password);
+    if (!result.ok) {
+      sendJson(res, result.status, { success: false, code: result.code, message: result.message });
+      return true;
+    }
+
+    const token = createAuthToken(result.profile.phone);
+    sendJson(res, 200, {
+      success: true,
+      message: '登录成功',
+      token,
+      user_info: result.profile,
+      data: { token, user_info: result.profile },
     });
     return true;
   }
 
   if (pathname === '/api/auth/profile') {
-    const profile = getSessionProfile(req);
+    const profile = requireSessionProfile(req, res);
+    if (!profile) {
+      return true;
+    }
     sendJson(res, 200, { success: true, data: profile });
     return true;
   }
 
   if (pathname === '/api/auth/logout') {
+    const token = getAuthToken(req);
+    if (token) {
+      localDb.prepare('DELETE FROM auth_sessions WHERE token = ?').run(token);
+    }
     sendJson(res, 200, { success: true, message: '退出成功' });
     return true;
   }
@@ -1002,16 +1349,28 @@ async function handleMockApi(req, res, requestUrl) {
   }
 
   if (pathname === '/api/auth/reset-capital') {
+    const profile = requireSessionProfile(req, res);
+    if (!profile) {
+      return true;
+    }
+
+    const updatedProfile = {
+      ...profile,
+      total_capital: 100000,
+      available_capital: 100000,
+      stock_market_value: 0,
+    };
+    saveUserProfile(updatedProfile);
     sendJson(res, 200, {
       success: true,
       message: '重置成功',
-      data: { is_vip: true, points_used: 0, total_capital: 100000 },
+      data: { is_vip: true, points_used: 0, total_capital: 100000, profile: updatedProfile },
     });
     return true;
   }
 
   if (pathname === '/api/payment/user/vip_status') {
-    sendJson(res, 200, { success: true, data: getVipStatus(getSessionProfile(req)) });
+    sendJson(res, 200, { success: true, data: getVipStatus(getSessionProfile(req) || createUserProfile()) });
     return true;
   }
 
@@ -1043,7 +1402,7 @@ async function handleMockApi(req, res, requestUrl) {
             final_amount: 30,
             payment_type: 'wechat',
             status: 'completed',
-            phone: getSessionProfile(req).phone,
+            phone: (getSessionProfile(req) || createUserProfile()).phone,
           },
         ],
         pagination: { total: 1, page: 1, limit: 10 },
@@ -1061,7 +1420,7 @@ async function handleMockApi(req, res, requestUrl) {
           final_amount: 30,
           payment_type: 'wechat',
           status: 'completed',
-          phone: getSessionProfile(req).phone,
+          phone: (getSessionProfile(req) || createUserProfile()).phone,
         },
       ],
       pagination: { total: 1, page: 1, limit: 10 },
@@ -1126,7 +1485,7 @@ async function handleMockApi(req, res, requestUrl) {
       success: true,
       data: [
         { user_id: 'local-user-001', username: '本地用户', phone: '13800138000', total_capital: 153500, training_all_history_count: 36, level: '韭菜根', losergod_times: 2, training_count_pk: 8, pk_win_rate: 55.5 },
-        { user_id: 'local-user-002', username: '逆神训练员', phone: '13800138001', total_capital: 126800, training_all_history_count: 58, level: '牛散', losergod_times: 4, training_count_pk: 12, pk_win_rate: 61.2 },
+        { user_id: 'local-user-002', username: 'Lafinger训练员', phone: '13800138001', total_capital: 126800, training_all_history_count: 58, level: '牛散', losergod_times: 4, training_count_pk: 12, pk_win_rate: 61.2 },
         { user_id: 'local-user-003', username: '模拟交易者', phone: '13800138002', total_capital: 113200, training_all_history_count: 42, level: '韭菜花', losergod_times: 1, training_count_pk: 6, pk_win_rate: 50 },
       ],
       total: 3,
@@ -1636,7 +1995,7 @@ async function sendFile(req, res, filePath) {
   const ext = path.extname(filePath).toLowerCase();
   res.writeHead(200, {
     'content-type': mimeTypes.get(ext) || 'application/octet-stream',
-    'cache-control': req.url.startsWith('/assets/') ? 'public, max-age=31536000, immutable' : 'no-cache',
+    'cache-control': 'no-store',
   });
   createReadStream(filePath).pipe(res);
 }
@@ -1693,8 +2052,22 @@ const server = createServer(async (req, res) => {
   res.end('Not found');
 });
 
-server.listen(port, () => {
-  console.log(`LoserGod clone running at http://localhost:${port}`);
+function getLanUrls() {
+  const urls = [];
+  for (const entries of Object.values(networkInterfaces())) {
+    for (const entry of entries || []) {
+      if (entry.family === 'IPv4' && !entry.internal) {
+        urls.push(`http://${entry.address}:${port}`);
+      }
+    }
+  }
+
+  return urls;
+}
+
+server.listen(port, host, () => {
+  console.log(`Lafinger clone running at http://localhost:${port}`);
+  console.log(`LAN access: ${getLanUrls().join(', ') || 'no active IPv4 network interface found'}`);
   console.log(`API mode: ${apiMode}`);
 });
 

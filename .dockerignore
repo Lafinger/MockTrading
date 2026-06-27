@@ -1,0 +1,6 @@
+node_modules
+.git
+.losergod-cache
+losergod-local-*.png
+senior-training-inspect.png
+*.log

@@ -235,6 +235,10 @@ function codeMatchesStockType(code = '', stockType = '') {
   return String(code).startsWith(normalized);
 }
 
+function isSeniorTrainingMode(mode = '') {
+  return ['senior_pk', 'senior_training_pk_records'].includes(String(mode || ''));
+}
+
 function pickRandomItem(items = []) {
   return items[Math.floor(Math.random() * items.length)];
 }
@@ -410,7 +414,7 @@ export async function buildAshareTrainingPayload({ body = {}, searchParams = new
   const explicitCode = body.stock_code || body.stockCode || body.symbol || body.code || body.asset_code ||
     searchParams.get('stock_code') || searchParams.get('stockCode') || searchParams.get('symbol') ||
     searchParams.get('code') || searchParams.get('asset_code');
-  const isSeniorParamsRequest = String(body.mode || searchParams.get('mode') || '') === 'senior_pk' && !explicitCode;
+  const isSeniorParamsRequest = isSeniorTrainingMode(body.mode || searchParams.get('mode')) && !explicitCode;
   const stockType = body.stock_type || body.stockType || searchParams.get('stock_type') || searchParams.get('stockType');
   const asset = isSeniorParamsRequest && kind === 'stock'
     ? await resolveRandomStockByType(stockType)
@@ -522,7 +526,7 @@ export async function getAshareMarketList(kind = 'stock', limit = 20, fsOverride
   url.searchParams.set('fs', fs);
   url.searchParams.set('fields', 'f12,f13,f14,f2,f3,f4,f5,f6');
 
-  const payload = await fetchJsonWithCache(url.toString(), `eastmoney:clist:${kind}:${limit}`);
+  const payload = await fetchJsonWithCache(url.toString(), `eastmoney:clist:${kind}:${limit}:${fs}`);
   const items = payload?.data?.diff || [];
   return items.map((item) => {
     const suffix = String(item.f13) === '1' ? 'SH' : 'SZ';

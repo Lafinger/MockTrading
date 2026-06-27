@@ -1,12 +1,12 @@
 # MockTrading
 模拟交易
 
-## 逆神站点复刻
+## Lafinger 站点复刻
 
-本项目当前包含一个 `https://www.losergod.com` 的本地前端镜像：
+本项目当前包含一个 Lafinger 本地前端镜像，原始静态资源来自 `https://www.losergod.com`：
 
 - `npm run mirror`：递归抓取原站首页、Vite chunk、CSS、图片和图标到 `public/`。
-- `npm start`：启动本地静态服务，默认地址 `http://localhost:5173`。
+- `npm start`：启动本地静态服务，默认监听 `0.0.0.0:5173`，本机访问 `http://localhost:5173`，同一局域网设备可访问启动日志里的 `http://<本机局域网IP>:5173`。
 - `npm run verify`：用本机 Chrome 打开本地站点，校验未登录首屏、登录后首页、关键路由，以及真实 A 股历史行情来源。
 
 ### A 股真实历史数据

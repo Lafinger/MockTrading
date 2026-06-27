@@ -1,11 +1,13 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
+import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 
 const rootDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const publicDir = path.join(rootDir, 'public');
 const chromePath = process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const requestedPort = Number(process.env.PORT || 5173);
 const port = await findFreePort(requestedPort);
@@ -26,7 +28,7 @@ function isPortFree(portToTry) {
     const tester = createServer()
       .once('error', () => resolve(false))
       .once('listening', () => tester.close(() => resolve(true)))
-      .listen(portToTry);
+      .listen(portToTry, '0.0.0.0');
   });
 }
 
@@ -106,13 +108,31 @@ async function verifyFullPositionTrainingNextStep(page, events, target) {
   }
 }
 
+async function verifyAboutBrandHeader(page, target) {
+  await page.goto(new URL('/about', target).toString(), { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(3000);
+
+  const headerTitle = (await page.locator('.header-title').innerText()).trim();
+  if (headerTitle !== 'Lafinger') {
+    throw new Error(`/about header title still shows old brand: ${headerTitle}`);
+  }
+
+  const text = await page.locator('body').innerText();
+  const oldBrandText = ['逆神', 'losergod', 'LoserGod', 'LOSERGOD'].filter((item) => text.includes(item));
+  if (oldBrandText.length > 0) {
+    throw new Error(`/about still shows old brand text: ${oldBrandText.join(', ')}`);
+  }
+}
+
 function waitForServer(child) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('server start timeout')), 15000);
+    let stdoutText = '';
     child.stdout.on('data', (chunk) => {
       const text = chunk.toString('utf8');
+      stdoutText += text;
       process.stdout.write(text);
-      if (text.includes('LoserGod clone running')) {
+      if (stdoutText.includes('Lafinger clone running') && stdoutText.includes('LAN access:')) {
         clearTimeout(timeout);
         resolve();
       }
@@ -123,6 +143,222 @@ function waitForServer(child) {
       reject(new Error(`server exited early with code ${code}`));
     });
   });
+}
+
+function uniqueVerifyPhone(suffix = 0) {
+  return `139${String(Date.now()).slice(-7)}${suffix}`;
+}
+
+function authHeaders(token) {
+  return {
+    'content-type': 'application/json',
+    Authorization: `Bearer ${token}`,
+  };
+}
+
+function formatHomeCapital(value) {
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) {
+    return '';
+  }
+
+  return numberValue >= 10000
+    ? `${(numberValue / 10000).toFixed(2)}万`
+    : String(numberValue);
+}
+
+async function verifyBrandAssets() {
+  const visibleFiles = [
+    path.join(publicDir, 'index.html'),
+    path.join(publicDir, 'assets/js/AboutView-FCe5Kuic.js'),
+    path.join(publicDir, 'assets/js/main-Dk2YD_9z.js'),
+  ];
+
+  for (const filePath of visibleFiles) {
+    const rawText = await fs.readFile(filePath, 'utf8');
+    const text = stripBrandGuard(rawText);
+    const forbidden = [
+      '逆神',
+      'LOSERGOD',
+      'LoserGod',
+      '关于losergod',
+      'Lafinger(losergod)',
+      '关于Lafinger（Lafinger）',
+      'aafinger',
+      'addEventaistener',
+      'childaist',
+      'toaowerCase',
+      '于于Lafinger',
+      '相于法律',
+      '于键技术',
+    ];
+    const found = forbidden.filter((item) => text.includes(item));
+    if (found.length > 0) {
+      throw new Error(`old visible brand text in ${path.relative(rootDir, filePath)}: ${found.join(', ')}`);
+    }
+  }
+
+  const indexHtml = await fs.readFile(path.join(publicDir, 'index.html'), 'utf8');
+  if (!indexHtml.includes('id="lafinger-brand-guard"')) {
+    throw new Error('index.html missing Lafinger visible brand guard');
+  }
+  if (!indexHtml.includes('CanvasRenderingContext2D') || !indexHtml.includes('rewriteText')) {
+    throw new Error('index.html brand guard does not patch canvas-rendered brand text');
+  }
+
+  const entryAssets = [
+    '/assets/js/main-Dk2YD_9z.js?v=lafinger-local-v2',
+    '/assets/js/vendor-BHBN5ZrF.js?v=lafinger-local-v2',
+    '/assets/js/echarts-L7P-wWsq.js?v=lafinger-local-v2',
+    '/assets/css/main-Bn1PmTVz.css?v=lafinger-local-v2',
+  ];
+  const missingEntryAssets = entryAssets.filter((asset) => !indexHtml.includes(asset));
+  if (missingEntryAssets.length > 0) {
+    throw new Error(`index.html missing local cache-busted assets: ${missingEntryAssets.join(', ')}`);
+  }
+
+  const mainBundle = await fs.readFile(path.join(publicDir, 'assets/js/main-Dk2YD_9z.js'), 'utf8');
+  const dynamicImports = [
+    './AboutView-FCe5Kuic.js?v=lafinger-local-v2',
+    './senior_TrainingPk-BkGLJXH4.js?v=lafinger-local-v2',
+  ];
+  const missingDynamicImports = dynamicImports.filter((asset) => !mainBundle.includes(asset));
+  if (missingDynamicImports.length > 0) {
+    throw new Error(`main bundle missing local cache-busted dynamic imports: ${missingDynamicImports.join(', ')}`);
+  }
+  if (/assets\/css\/[^"'?#]+\.css\?v=lafinger-local-v2/.test(mainBundle)) {
+    throw new Error('main bundle incorrectly cache-busts CSS runtime dependencies as module imports');
+  }
+}
+
+function stripBrandGuard(text) {
+  return text.replace(/<script id="lafinger-brand-guard">[\s\S]*?<\/script>/, '');
+}
+
+async function verifyStaticCacheHeaders(target) {
+  const assets = [
+    '/',
+    '/assets/js/main-Dk2YD_9z.js?v=lafinger-local-v2',
+    '/assets/js/AboutView-FCe5Kuic.js?v=lafinger-local-v2',
+  ];
+
+  for (const asset of assets) {
+    const response = await fetch(new URL(asset, target));
+    if (!response.ok) {
+      throw new Error(`static asset failed: ${asset} HTTP ${response.status}`);
+    }
+
+    const cacheControl = response.headers.get('cache-control') || '';
+    if (!cacheControl.includes('no-store')) {
+      throw new Error(`static asset ${asset} is cacheable: ${cacheControl || '<missing>'}`);
+    }
+  }
+}
+
+async function readJsonResponse(response) {
+  const text = await response.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function verifyAuthAccounts(target) {
+  const password = 'Verify123456';
+  const primaryPhone = uniqueVerifyPhone(1);
+  const secondaryPhone = uniqueVerifyPhone(2);
+
+  const unregisteredLogin = await fetch(new URL('/api/auth/login', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ phone: primaryPhone, password }),
+  });
+  if (unregisteredLogin.ok) {
+    throw new Error('unregistered account login unexpectedly succeeded');
+  }
+
+  const registerResponse = await fetch(new URL('/api/auth/register', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ phone: primaryPhone, password }),
+  });
+  if (!registerResponse.ok) {
+    throw new Error(`register primary account failed: HTTP ${registerResponse.status}`);
+  }
+
+  const registerPayload = await readJsonResponse(registerResponse);
+  const primaryToken = registerPayload.token || registerPayload.data?.token;
+  const primaryProfile = registerPayload.user_info || registerPayload.data?.user_info || registerPayload.data?.profile;
+  if (!primaryToken || primaryProfile?.phone !== primaryPhone || primaryProfile?.vip_status !== 'active') {
+    throw new Error(`registered account payload invalid: ${JSON.stringify(registerPayload)}`);
+  }
+
+  const duplicateRegister = await fetch(new URL('/api/auth/register', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ phone: primaryPhone, password }),
+  });
+  if (duplicateRegister.ok) {
+    throw new Error('duplicate account registration unexpectedly succeeded');
+  }
+
+  const wrongPasswordLogin = await fetch(new URL('/api/auth/login', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ phone: primaryPhone, password: 'Wrong123456' }),
+  });
+  if (wrongPasswordLogin.ok) {
+    throw new Error('wrong password login unexpectedly succeeded');
+  }
+
+  const loginResponse = await fetch(new URL('/api/auth/login', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ phone: primaryPhone, password }),
+  });
+  if (!loginResponse.ok) {
+    throw new Error(`login primary account failed: HTTP ${loginResponse.status}`);
+  }
+
+  const loginPayload = await readJsonResponse(loginResponse);
+  const loginToken = loginPayload.token || loginPayload.data?.token;
+  if (!loginToken) {
+    throw new Error(`login did not return token: ${JSON.stringify(loginPayload)}`);
+  }
+
+  const profileResponse = await fetch(new URL('/api/auth/profile', target), {
+    headers: { Authorization: `Bearer ${loginToken}` },
+  });
+  if (!profileResponse.ok) {
+    throw new Error(`profile with token failed: HTTP ${profileResponse.status}`);
+  }
+
+  const profilePayload = await readJsonResponse(profileResponse);
+  if (profilePayload?.data?.phone !== primaryPhone || profilePayload?.data?.vip_status !== 'active') {
+    throw new Error(`profile payload invalid: ${JSON.stringify(profilePayload)}`);
+  }
+
+  const unauthProfile = await fetch(new URL('/api/auth/profile', target));
+  if (unauthProfile.ok) {
+    throw new Error('profile without token unexpectedly succeeded');
+  }
+
+  const secondaryRegister = await fetch(new URL('/api/auth/register', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ phone: secondaryPhone, password }),
+  });
+  if (!secondaryRegister.ok) {
+    throw new Error(`register secondary account failed: HTTP ${secondaryRegister.status}`);
+  }
+
+  const secondaryPayload = await readJsonResponse(secondaryRegister);
+  const secondaryToken = secondaryPayload.token || secondaryPayload.data?.token;
+  if (!secondaryToken) {
+    throw new Error(`secondary register did not return token: ${JSON.stringify(secondaryPayload)}`);
+  }
+
+  return {
+    primary: { phone: primaryPhone, password, token: loginToken },
+    secondary: { phone: secondaryPhone, password, token: secondaryToken },
+  };
 }
 
 async function verifyRealAshareData(target) {
@@ -162,11 +398,18 @@ async function verifyRealAshareData(target) {
 }
 
 async function verifySeniorTrainingParamsPayload(target) {
+  const modes = ['senior_pk', 'senior_training_pk_records'];
+  for (const mode of modes) {
+    await verifySeniorTrainingModePayload(target, mode);
+  }
+}
+
+async function verifySeniorTrainingModePayload(target, mode) {
   const response = await fetch(new URL('/api/random_data', target), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      mode: 'senior_pk',
+      mode,
       observe_days: 100,
       train_days: 50,
       stock_type: '60',
@@ -181,7 +424,7 @@ async function verifySeniorTrainingParamsPayload(target) {
   });
 
   if (!response.ok) {
-    throw new Error(`senior training params data request failed: HTTP ${response.status}`);
+    throw new Error(`senior training params data request failed for ${mode}: HTTP ${response.status}`);
   }
 
   const text = await response.text();
@@ -190,14 +433,17 @@ async function verifySeniorTrainingParamsPayload(target) {
   const hasTrainingRows = Array.isArray(payload.observe_data) && payload.observe_data.length === 100 &&
     Array.isArray(payload.train_data) && payload.train_data.length === 50;
   const isRequestedStockType = /^60\d{4}\.SH$/.test(payload.stock_code);
+  const dataRows = Array.isArray(payload.data) ? payload.data.length : 0;
 
-  if (!payload.success || !hasTrainingRows || !isRequestedStockType || !payload.stock_name || payloadBytes > 1_000_000) {
+  if (!payload.success || !hasTrainingRows || !isRequestedStockType || !payload.stock_name || dataRows !== 150 || payloadBytes > 1_000_000) {
     throw new Error(`senior training params payload verification failed: ${JSON.stringify({
+      mode,
       success: payload.success,
       stockCode: payload.stock_code,
       stockName: payload.stock_name,
       observeRows: payload.observe_data?.length,
       trainRows: payload.train_data?.length,
+      dataRows,
       payloadBytes,
     })}`);
   }
@@ -267,8 +513,10 @@ function buildVerificationKlines(count = 40) {
   });
 }
 
-async function verifyTrainingRecordPersistence(target) {
-  const phone = '13800138000';
+async function verifyTrainingRecordPersistence(target, accounts) {
+  const phone = accounts.primary.phone;
+  const primaryToken = accounts.primary.token;
+  const secondaryToken = accounts.secondary.token;
   const unique = Date.now();
   const stockName = `验证股票${unique}`;
   const klineData = buildVerificationKlines();
@@ -302,7 +550,7 @@ async function verifyTrainingRecordPersistence(target) {
 
   const createResponse = await fetch(new URL('/api/training-pk-sessions', target), {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: authHeaders(primaryToken),
     body: JSON.stringify({
       phone,
       stock_code: baseRecord.stock_code,
@@ -321,7 +569,7 @@ async function verifyTrainingRecordPersistence(target) {
 
   const updateResponse = await fetch(new URL(`/api/training-pk-sessions/${encodeURIComponent(sessionCode)}`, target), {
     method: 'PUT',
-    headers: { 'content-type': 'application/json' },
+    headers: authHeaders(primaryToken),
     body: JSON.stringify({
       phone,
       operations: [{ type: 'next', kline_index: 21 }],
@@ -337,7 +585,7 @@ async function verifyTrainingRecordPersistence(target) {
   const completedRecordId = `verify-session-record-${unique}`;
   const completeResponse = await fetch(new URL(`/api/training-pk-sessions/${encodeURIComponent(sessionCode)}/complete`, target), {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: authHeaders(primaryToken),
     body: JSON.stringify({
       phone,
       training_record: {
@@ -351,7 +599,9 @@ async function verifyTrainingRecordPersistence(target) {
     throw new Error(`complete training session failed: HTTP ${completeResponse.status}`);
   }
 
-  const listResponse = await fetch(new URL(`/api/training-records?phone=${phone}&page=1&pageSize=50`, target));
+  const listResponse = await fetch(new URL(`/api/training-records?phone=${phone}&page=1&pageSize=50`, target), {
+    headers: { Authorization: `Bearer ${primaryToken}` },
+  });
   if (!listResponse.ok) {
     throw new Error(`training record list failed: HTTP ${listResponse.status}`);
   }
@@ -385,12 +635,36 @@ async function verifyTrainingRecordPersistence(target) {
     throw new Error(`completed training record missing fields: ${missingFields.join(', ')}`);
   }
 
-  const recordResponse = await fetch(new URL(`/api/lookback/training-record/${encodeURIComponent(completedRecordId)}`, target));
+  const secondaryListResponse = await fetch(new URL(`/api/training-records?phone=${phone}&page=1&pageSize=50`, target), {
+    headers: { Authorization: `Bearer ${secondaryToken}` },
+  });
+  if (!secondaryListResponse.ok) {
+    throw new Error(`secondary training record list failed: HTTP ${secondaryListResponse.status}`);
+  }
+
+  const secondaryListPayload = await secondaryListResponse.json();
+  const secondaryRecords = secondaryListPayload?.data?.records || [];
+  if (secondaryRecords.some((record) => record.record_id === completedRecordId)) {
+    throw new Error('secondary account can see primary account training record');
+  }
+
+  const recordResponse = await fetch(new URL(`/api/lookback/training-record/${encodeURIComponent(completedRecordId)}`, target), {
+    headers: { Authorization: `Bearer ${primaryToken}` },
+  });
   if (!recordResponse.ok) {
     throw new Error(`lookback training record failed: HTTP ${recordResponse.status}`);
   }
 
-  const klineResponse = await fetch(new URL(`/api/lookback/kline-data/${encodeURIComponent(completedRecordId)}`, target));
+  const secondaryRecordResponse = await fetch(new URL(`/api/lookback/training-record/${encodeURIComponent(completedRecordId)}`, target), {
+    headers: { Authorization: `Bearer ${secondaryToken}` },
+  });
+  if (secondaryRecordResponse.ok) {
+    throw new Error('secondary account can open primary account lookback record');
+  }
+
+  const klineResponse = await fetch(new URL(`/api/lookback/kline-data/${encodeURIComponent(completedRecordId)}`, target), {
+    headers: { Authorization: `Bearer ${primaryToken}` },
+  });
   if (!klineResponse.ok) {
     throw new Error(`lookback kline data failed: HTTP ${klineResponse.status}`);
   }
@@ -405,10 +679,11 @@ async function verifyTrainingRecordPersistence(target) {
   const directRecordId = `verify-direct-record-${unique}`;
   const directResponse = await fetch(new URL('/api/training-records', target), {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: authHeaders(primaryToken),
     body: JSON.stringify({
       training_record: {
         ...baseRecord,
+        phone: accounts.secondary.phone,
         record_id: directRecordId,
         id: directRecordId,
         stock_name: `直存股票${unique}`,
@@ -422,16 +697,150 @@ async function verifyTrainingRecordPersistence(target) {
     throw new Error(`direct training record save failed: HTTP ${directResponse.status}`);
   }
 
-  const directListResponse = await fetch(new URL(`/api/training-records?phone=${phone}&page=1&pageSize=50`, target));
+  const directListResponse = await fetch(new URL(`/api/training-records?phone=${phone}&page=1&pageSize=50`, target), {
+    headers: { Authorization: `Bearer ${primaryToken}` },
+  });
   const directListPayload = await directListResponse.json();
   const directRecord = (directListPayload?.data?.records || []).find((record) => record.record_id === directRecordId);
   if (!directRecord) {
     throw new Error(`direct training record not found in list: ${directRecordId}`);
   }
 
+  if (directRecord.phone !== phone) {
+    throw new Error(`direct training record did not use token phone: ${directRecord.phone}`);
+  }
+
+  const secondaryDirectListResponse = await fetch(new URL(`/api/training-records?phone=${accounts.secondary.phone}&page=1&pageSize=50`, target), {
+    headers: { Authorization: `Bearer ${secondaryToken}` },
+  });
+  const secondaryDirectListPayload = await secondaryDirectListResponse.json();
+  const leakedDirectRecord = (secondaryDirectListPayload?.data?.records || []).find((record) => record.record_id === directRecordId);
+  if (leakedDirectRecord) {
+    throw new Error('secondary account can see a direct record saved by primary token');
+  }
+
+  const frontendRecordId = `verify-frontend-senior-record-${unique}`;
+  const frontendFinalCapital = 117650;
+  const { mode: omittedFrontendMode, ...frontendRecordBase } = baseRecord;
+  void omittedFrontendMode;
+  const frontendSaveResponse = await fetch(new URL('/api/training-records', target), {
+    method: 'POST',
+    headers: {
+      ...authHeaders(primaryToken),
+      'X-Mode': 'senior_pk',
+    },
+    body: JSON.stringify({
+      training_record: {
+        ...frontendRecordBase,
+        record_id: frontendRecordId,
+        id: frontendRecordId,
+        stock_name: `前端排位股票${unique}`,
+        final_capital: frontendFinalCapital,
+        final_assets: frontendFinalCapital,
+        total_profit: frontendFinalCapital - baseRecord.initial_capital,
+        operation_profit_rate: (frontendFinalCapital - baseRecord.initial_capital) / baseRecord.initial_capital,
+      },
+    }),
+  });
+  if (!frontendSaveResponse.ok) {
+    throw new Error(`frontend senior training record save failed: HTTP ${frontendSaveResponse.status}`);
+  }
+
+  const frontendListResponse = await fetch(new URL(`/api/training-records?phone=${phone}&page=1&pageSize=50&modes=senior_pk,Full_Position_Training_pk,full_position`, target), {
+    headers: { Authorization: `Bearer ${primaryToken}` },
+  });
+  if (!frontendListResponse.ok) {
+    throw new Error(`frontend senior training record list failed: HTTP ${frontendListResponse.status}`);
+  }
+
+  const frontendListPayload = await frontendListResponse.json();
+  const frontendRecord = (frontendListPayload?.data?.records || []).find((record) => record.record_id === frontendRecordId);
+  if (!frontendRecord) {
+    throw new Error(`frontend senior training record not found with senior filters: ${frontendRecordId}`);
+  }
+
+  const frontendRecordModes = [frontendRecord.mode, frontendRecord.source_mode, frontendRecord.index_mode].filter(Boolean);
+  if (!frontendRecordModes.includes('senior_pk') && !frontendRecordModes.includes('Full_Position_Training_pk') && !frontendRecordModes.includes('full_position')) {
+    throw new Error(`frontend senior training record mode is not compatible: ${JSON.stringify(frontendRecordModes)}`);
+  }
+
+  const updatedProfileResponse = await fetch(new URL('/api/auth/profile', target), {
+    headers: { Authorization: `Bearer ${primaryToken}` },
+  });
+  if (!updatedProfileResponse.ok) {
+    throw new Error(`profile after frontend senior training save failed: HTTP ${updatedProfileResponse.status}`);
+  }
+
+  const updatedProfilePayload = await updatedProfileResponse.json();
+  const updatedProfile = updatedProfilePayload?.data || {};
+  if (updatedProfile.total_capital !== frontendFinalCapital || updatedProfile.available_capital !== frontendFinalCapital) {
+    throw new Error(`frontend senior training did not sync virtual capital: ${JSON.stringify({
+      total_capital: updatedProfile.total_capital,
+      available_capital: updatedProfile.available_capital,
+      expected: frontendFinalCapital,
+    })}`);
+  }
+
+  const rawFrontendRecordId = `verify-raw-frontend-senior-record-${unique}`;
+  const rawFrontendFinalCapital = 123450;
+  const rawFrontendSaveResponse = await fetch(new URL('/api/training-records', target), {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'X-Mode': 'senior_pk',
+    },
+    body: JSON.stringify({
+      training_record: {
+        ...frontendRecordBase,
+        phone,
+        user_id: phone,
+        record_id: rawFrontendRecordId,
+        id: rawFrontendRecordId,
+        stock_name: `裸前端排位股票${unique}`,
+        final_capital: rawFrontendFinalCapital,
+        final_assets: rawFrontendFinalCapital,
+        total_profit: rawFrontendFinalCapital - baseRecord.initial_capital,
+        operation_profit_rate: (rawFrontendFinalCapital - baseRecord.initial_capital) / baseRecord.initial_capital,
+      },
+    }),
+  });
+  if (!rawFrontendSaveResponse.ok) {
+    throw new Error(`raw frontend senior training record save failed: HTTP ${rawFrontendSaveResponse.status}`);
+  }
+
+  const rawFrontendListResponse = await fetch(new URL(`/api/training-records?phone=${phone}&page=1&pageSize=50&modes=senior_pk,Full_Position_Training_pk,full_position`, target));
+  if (!rawFrontendListResponse.ok) {
+    throw new Error(`raw frontend senior training record list failed: HTTP ${rawFrontendListResponse.status}`);
+  }
+
+  const rawFrontendListPayload = await rawFrontendListResponse.json();
+  const rawFrontendRecord = (rawFrontendListPayload?.data?.records || []).find((record) => record.record_id === rawFrontendRecordId);
+  if (!rawFrontendRecord) {
+    throw new Error(`raw frontend senior training record not found with senior filters: ${rawFrontendRecordId}`);
+  }
+
+  const rawUpdatedProfileResponse = await fetch(new URL('/api/auth/profile', target), {
+    headers: { Authorization: `Bearer ${primaryToken}` },
+  });
+  if (!rawUpdatedProfileResponse.ok) {
+    throw new Error(`profile after raw frontend senior training save failed: HTTP ${rawUpdatedProfileResponse.status}`);
+  }
+
+  const rawUpdatedProfilePayload = await rawUpdatedProfileResponse.json();
+  const rawUpdatedProfile = rawUpdatedProfilePayload?.data || {};
+  if (rawUpdatedProfile.total_capital !== rawFrontendFinalCapital || rawUpdatedProfile.available_capital !== rawFrontendFinalCapital) {
+    throw new Error(`raw frontend senior training did not sync virtual capital: ${JSON.stringify({
+      total_capital: rawUpdatedProfile.total_capital,
+      available_capital: rawUpdatedProfile.available_capital,
+      expected: rawFrontendFinalCapital,
+    })}`);
+  }
+
   return {
     completedRecordId,
     directRecordId,
+    frontendRecordId,
+    frontendFinalCapital: rawFrontendFinalCapital,
     stockName,
   };
 }
@@ -488,6 +897,15 @@ async function verifySeniorTrainingParamsCanEnter(page, events, target) {
     throw new Error('/senior_training_pk/params failed to enter training page');
   }
 
+  await page.waitForFunction(() => {
+    const title = document.querySelector('.stock-info .top-row h2, .stock-info h2')?.textContent?.trim();
+    return Boolean(title && title !== '模拟炒股');
+  }, { timeout: 20000 });
+  const stockTitle = (await page.locator('.stock-info .top-row h2, .stock-info h2').first().innerText()).trim();
+  if (!stockTitle || stockTitle === '模拟炒股') {
+    throw new Error(`/senior_training_pk/training_pk stock title did not show a stock name: ${stockTitle || '<empty>'}`);
+  }
+
   const routeEvents = events.slice(eventStart);
   const fatalEvents = routeEvents.filter((event) => (
     event.startsWith('pageerror:') ||
@@ -503,16 +921,19 @@ async function verifySeniorTrainingParamsCanEnter(page, events, target) {
 
 const server = spawn(process.execPath, ['server.mjs'], {
   cwd: rootDir,
-  env: { ...process.env, PORT: String(port) },
+  env: { ...process.env, PORT: String(port), HOST: '0.0.0.0' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 
 try {
   await waitForServer(server);
+  await verifyBrandAssets();
+  await verifyStaticCacheHeaders(target);
   await verifyRealAshareData(target);
   await verifySeniorTrainingParamsPayload(target);
   await verifyStrategySignalsApi(target);
-  const trainingRecordVerification = await verifyTrainingRecordPersistence(target);
+  const accounts = await verifyAuthAccounts(target);
+  const trainingRecordVerification = await verifyTrainingRecordPersistence(target, accounts);
 
   const browser = await chromium.launch({ executablePath: chromePath, headless: true });
   try {
@@ -529,7 +950,7 @@ try {
     await page.waitForTimeout(4000);
 
     const bodyText = await page.locator('body').innerText();
-    const requiredText = ['逆神', '首页', 'PK模拟', '投资模拟', 'TradingView模拟', 'AI工具组', '登录', '注册', '重置密码'];
+    const requiredText = ['Lafinger', '首页', 'PK模拟', '投资模拟', 'TradingView模拟', 'AI工具组', '登录', '注册', '重置密码'];
     const missing = requiredText.filter((text) => !bodyText.includes(text));
 
     await page.screenshot({ path: path.join(rootDir, 'losergod-local-1440.png'), fullPage: true });
@@ -538,15 +959,21 @@ try {
       throw new Error(`missing text: ${missing.join(', ')}`);
     }
 
-    await page.getByPlaceholder('请输入手机号').fill('13800138000');
-    await page.getByPlaceholder('请输入密码').fill('123456');
+    const oldBrandText = ['逆神', 'losergod', 'LoserGod', 'LOSERGOD'].filter((text) => bodyText.includes(text));
+    if (oldBrandText.length > 0) {
+      throw new Error(`old brand text still visible on home page: ${oldBrandText.join(', ')}`);
+    }
+
+    await page.getByPlaceholder('请输入手机号').fill(accounts.primary.phone);
+    await page.getByPlaceholder('请输入密码').fill(accounts.primary.password);
     await page.locator('input[type=checkbox]').check({ force: true });
     await page.getByRole('button', { name: '登录' }).click();
     await page.waitForURL('**/index', { timeout: 15000 });
     await page.waitForTimeout(5000);
 
     const loggedInText = await page.locator('body').innerText();
-    const loggedInRequiredText = ['本地用户', '虚拟总资产', '15.35万', '积分', 'VIP', '投资组合排行'];
+    const expectedHomeCapital = formatHomeCapital(trainingRecordVerification.frontendFinalCapital);
+    const loggedInRequiredText = ['本地用户', '虚拟总资产', expectedHomeCapital, '积分', 'VIP', '投资组合排行'];
     const loggedInMissing = loggedInRequiredText.filter((text) => !loggedInText.includes(text));
     await page.screenshot({ path: path.join(rootDir, 'losergod-local-login-1440.png'), fullPage: true });
 
@@ -579,13 +1006,14 @@ try {
       ['/virtual_exchange/orders', ['当前委托', 'LGD/USDT']],
       ['/notebook', ['我的笔记', '写笔记']],
       ['/materials', ['资料领取', '平台特色']],
-      ['/about', ['关于losergod', '联系我们']],
+      ['/about', ['关于Lafinger', '联系我们']],
     ];
 
     for (const [route, texts] of routeChecks) {
       await verifyRoute(page, events, target, route, texts);
     }
 
+    await verifyAboutBrandHeader(page, target);
     await verifyTradeHistoryPageShowsRecord(page, target, trainingRecordVerification);
     await verifySeniorTrainingParamsCanEnter(page, events, target);
     await verifyFullPositionTrainingNextStep(page, events, target);
