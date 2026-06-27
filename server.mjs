@@ -3,6 +3,16 @@ import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  buildAshareTrainingPayload,
+  buildCompareKlineRows,
+  buildFearGreedData,
+  buildOverlayData,
+  buildSimpleStrategyResult,
+  getAshareMarketList,
+  getDefaultIndexRows,
+  searchAshareAssets,
+} from './src/ashare-data.mjs';
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(rootDir, 'public');
@@ -177,13 +187,7 @@ function getPortfolioRows() {
 }
 
 function getIndexRows() {
-  return [
-    { index_code: '000001.SH', index_name: '上证指数', code: '000001.SH', name: '上证指数' },
-    { index_code: '000300.SH', index_name: '沪深300', code: '000300.SH', name: '沪深300' },
-    { index_code: '399001.SZ', index_name: '深证成指', code: '399001.SZ', name: '深证成指' },
-    { index_code: '399006.SZ', index_name: '创业板指', code: '399006.SZ', name: '创业板指' },
-    { index_code: 'IXIC', index_name: '纳斯达克综合指数', code: 'IXIC', name: '纳斯达克综合指数' },
-  ];
+  return getDefaultIndexRows();
 }
 
 function getStrategyDescriptions() {
@@ -277,15 +281,15 @@ function getMarketRows(count = 260, basePrice = 100) {
   });
 }
 
-function getTrainingPayload(kind = 'stock') {
-  const rows = getMarketRows(320, kind === 'etf' ? 3.8 : 108);
+function getSyntheticFuturesPayload() {
+  const rows = getMarketRows(320, 3650);
   const observeData = rows.slice(0, 200);
   const trainData = rows.slice(200, 300);
   const stockInfo = {
-    code: kind === 'etf' ? '510300.SH' : '600519.SH',
-    name: kind === 'etf' ? '沪深300ETF' : '贵州茅台',
-    stock_code: kind === 'etf' ? '510300.SH' : '600519.SH',
-    stock_name: kind === 'etf' ? '沪深300ETF' : '贵州茅台',
+    code: 'SHFE_rb9999',
+    name: '螺纹钢主连',
+    stock_code: 'SHFE_rb9999',
+    stock_name: '螺纹钢主连',
   };
 
   return {
@@ -310,7 +314,7 @@ function getTrainingPayload(kind = 'stock') {
     observe_bars: 200,
     train_bars: 100,
     period: 'day',
-    metadata: { period: 'day', source: 'local mock' },
+    metadata: { period: 'day', source: 'synthetic futures mock' },
     start_index: 200,
     end_index: 300,
   };
@@ -647,23 +651,21 @@ async function handleMockApi(req, res, requestUrl) {
   }
 
   if (pathname === '/api/search/stocks') {
+    const keyword = requestUrl.searchParams.get('keyword') || requestUrl.searchParams.get('q') || requestUrl.searchParams.get('query') || requestUrl.searchParams.get('search') || requestUrl.searchParams.get('input') || '';
+    const rows = await searchAshareAssets(keyword, 'stock', 20);
     sendJson(res, 200, {
       success: true,
-      data: [
-        { stock_code: '600519.SH', stock_name: '贵州茅台' },
-        { stock_code: '000001.SZ', stock_name: '平安银行' },
-      ],
+      data: rows,
     });
     return true;
   }
 
   if (pathname === '/api/search/etfs') {
+    const keyword = requestUrl.searchParams.get('keyword') || requestUrl.searchParams.get('q') || requestUrl.searchParams.get('query') || requestUrl.searchParams.get('search') || requestUrl.searchParams.get('input') || '';
+    const rows = await searchAshareAssets(keyword, 'etf', 20);
     sendJson(res, 200, {
       success: true,
-      data: [
-        { etf_code: '510300.SH', etf_name: '沪深300ETF' },
-        { etf_code: '159915.SZ', etf_name: '创业板ETF' },
-      ],
+      data: rows,
     });
     return true;
   }
@@ -673,17 +675,22 @@ async function handleMockApi(req, res, requestUrl) {
     return true;
   }
 
-  if (
-    pathname === '/api/random_data' ||
-    pathname === '/api/futures/random_data' ||
-    pathname === '/api/etf/random_data' ||
-    pathname === '/api/options/random_data' ||
-    pathname === '/api/simulated_range/stock' ||
-    pathname === '/api/simulated_range/etf' ||
-    pathname === '/api/data/historical_range'
-  ) {
-    const kind = pathname.includes('/etf') ? 'etf' : 'stock';
-    sendJson(res, 200, getTrainingPayload(kind));
+  if (pathname === '/api/random_data' || pathname === '/api/simulated_range/stock' || pathname === '/api/data/historical_range') {
+    const body = await readJsonBody(req);
+    const payload = await buildAshareTrainingPayload({ body, searchParams: requestUrl.searchParams, kind: 'stock' });
+    sendJson(res, 200, payload);
+    return true;
+  }
+
+  if (pathname === '/api/etf/random_data' || pathname === '/api/options/random_data' || pathname === '/api/simulated_range/etf') {
+    const body = await readJsonBody(req);
+    const payload = await buildAshareTrainingPayload({ body, searchParams: requestUrl.searchParams, kind: 'etf' });
+    sendJson(res, 200, payload);
+    return true;
+  }
+
+  if (pathname === '/api/futures/random_data') {
+    sendJson(res, 200, getSyntheticFuturesPayload());
     return true;
   }
 
@@ -700,76 +707,66 @@ async function handleMockApi(req, res, requestUrl) {
   }
 
   if (pathname === '/api/options/etf/index_kline') {
-    sendJson(res, 200, { success: true, data: getMarketRows(240, 3.5) });
+    const payload = await buildAshareTrainingPayload({ searchParams: requestUrl.searchParams, kind: 'etf' });
+    sendJson(res, 200, { success: true, data: payload.data, metadata: payload.metadata });
     return true;
   }
 
   if (pathname === '/api/quant_index/overlay_data') {
+    const code = requestUrl.searchParams.get('code') || requestUrl.searchParams.get('index_code') || '000001.SH';
+    const overlay = await buildOverlayData({ code, kind: 'index' });
     sendJson(res, 200, {
       success: true,
-      data: [
-        { date: '2026-06-01', signal: 'buy', value: 1 },
-        { date: '2026-06-18', signal: 'sell', value: -1 },
-      ],
-      signals: [],
+      data: overlay,
+      klines: overlay.klines,
+      signals: overlay.signals,
+      metadata: overlay.metadata,
     });
     return true;
   }
 
   if (pathname === '/api/index_signals/super_index' || pathname === '/api/index_signals/fear_greed_index') {
+    const fearGreed = await buildFearGreedData();
     sendJson(res, 200, {
       success: true,
-      data: {
-        code: 'SUPER_INDEX',
-        name: '逆神恐惧贪婪指数',
-        items: [
-          { date: '2026-06-24', value: 42 },
-          { date: '2026-06-25', value: 48 },
-          { date: '2026-06-26', value: 55 },
-          { date: '2026-06-27', value: 59 },
-        ],
-      },
+      data: fearGreed,
+      items: fearGreed.items,
     });
     return true;
   }
 
   if (pathname === '/api/stock-selection/search') {
+    const rows = await getAshareMarketList('stock', 50);
     sendJson(res, 200, {
       success: true,
       data: {
-        results: [
-          { stock_code: '600519.SH', stock_name: '贵州茅台', score: 91, reason: '趋势强、量价配合' },
-          { stock_code: '000001.SZ', stock_name: '平安银行', score: 84, reason: '低位放量' },
-        ],
+        results: rows.map((row) => ({
+          ...row,
+          score: Number((50 + Math.max(-10, Math.min(10, row.change_percent || 0)) * 4).toFixed(2)),
+          reason: `东方财富实时榜单，涨跌幅 ${row.change_percent ?? 0}%`,
+        })),
       },
-      results: [
-        { stock_code: '600519.SH', stock_name: '贵州茅台', score: 91, reason: '趋势强、量价配合' },
-        { stock_code: '000001.SZ', stock_name: '平安银行', score: 84, reason: '低位放量' },
-      ],
+      results: rows,
     });
     return true;
   }
 
   if (pathname === '/api/compare/kline/batch') {
+    const body = await readJsonBody(req);
+    const rows = await buildCompareKlineRows(body);
     sendJson(res, 200, {
       success: true,
-      data: [
-        { code: '000001.SH', name: '上证指数', klines: getMarketRows(120, 3100) },
-        { code: '000300.SH', name: '沪深300', klines: getMarketRows(120, 3600) },
-      ],
+      data: rows,
     });
     return true;
   }
 
   if (pathname === '/api/run_strategy') {
+    const body = await readJsonBody(req);
+    const result = await buildSimpleStrategyResult(body);
     sendJson(res, 200, {
       success: true,
-      data: {
-        trades: [],
-        equity_curve: getMarketRows(80, 1).map((row, index) => ({ date: row.date, value: Number((1 + index * 0.004).toFixed(4)) })),
-        total_return: 0.328,
-        max_drawdown: 0.084,
-      },
+      data: result,
     });
     return true;
   }
@@ -1149,7 +1146,16 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    await handleMockApi(req, res, requestUrl);
+    try {
+      await handleMockApi(req, res, requestUrl);
+    } catch (error) {
+      sendJson(res, 502, {
+        code: 502,
+        success: false,
+        data: null,
+        message: `real market data fetch failed: ${error.message}`,
+      });
+    }
     return;
   }
 

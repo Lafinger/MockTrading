@@ -79,6 +79,42 @@ function waitForServer(child) {
   });
 }
 
+async function verifyRealAshareData(target) {
+  const response = await fetch(new URL('/api/random_data', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      stock_code: '000001.SZ',
+      observe_days: 200,
+      train_days: 100,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`real ashare data request failed: HTTP ${response.status}`);
+  }
+
+  const payload = await response.json();
+  const metadata = payload.metadata || {};
+  const firstDate = metadata.first_date || '';
+  const totalRows = Number(metadata.total_rows || 0);
+  const isEastmoney = metadata.source === 'eastmoney_push2his';
+  const hasLongHistory = firstDate <= '1992-01-01' && totalRows > 5000;
+  const hasTrainingRows = Array.isArray(payload.observe_data) && payload.observe_data.length === 200 &&
+    Array.isArray(payload.train_data) && payload.train_data.length === 100;
+
+  if (!payload.success || !isEastmoney || !hasLongHistory || !hasTrainingRows) {
+    throw new Error(`real ashare data verification failed: ${JSON.stringify({
+      success: payload.success,
+      source: metadata.source,
+      firstDate,
+      totalRows,
+      observeRows: payload.observe_data?.length,
+      trainRows: payload.train_data?.length,
+    })}`);
+  }
+}
+
 const server = spawn(process.execPath, ['server.mjs'], {
   cwd: rootDir,
   env: { ...process.env, PORT: String(port) },
@@ -87,6 +123,7 @@ const server = spawn(process.execPath, ['server.mjs'], {
 
 try {
   await waitForServer(server);
+  await verifyRealAshareData(target);
 
   const browser = await chromium.launch({ executablePath: chromePath, headless: true });
   try {
