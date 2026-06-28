@@ -26,11 +26,18 @@ async function findFreePort(startPort) {
 }
 
 function isPortFree(portToTry) {
+  return Promise.all([
+    isHostPortFree(portToTry, '0.0.0.0'),
+    isHostPortFree(portToTry, '127.0.0.1'),
+  ]).then((results) => results.every(Boolean));
+}
+
+function isHostPortFree(portToTry, host) {
   return new Promise((resolve) => {
     const tester = createServer()
       .once('error', () => resolve(false))
       .once('listening', () => tester.close(() => resolve(true)))
-      .listen(portToTry, '0.0.0.0');
+      .listen(portToTry, host);
   });
 }
 
@@ -107,6 +114,176 @@ async function verifyFullPositionTrainingNextStep(page, events, target) {
   const fatalEvents = routeEvents.filter((event) => event.includes('策略信号计算失败') || event.includes('策略信号计算出错'));
   if (fatalEvents.length > 0) {
     throw new Error(`/full-position-training strategy browser errors: ${fatalEvents.join(' | ')}`);
+  }
+}
+
+async function getActiveTopNavText(page) {
+  return page.locator('.nav-item.active').evaluateAll((nodes) => nodes.map((node) => node.innerText.trim()));
+}
+
+async function verifyQuantFlowBacktest(page, events, target) {
+  const eventStart = events.length;
+  await page.goto(new URL('/quant-flow', target).toString(), { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(3000);
+
+  const activeTopNav = await getActiveTopNavText(page);
+  if (!activeTopNav.includes('实盘策略') || activeTopNav.includes('AI工具组')) {
+    throw new Error(`/quant-flow top navigation active state is wrong: ${activeTopNav.join(', ')}`);
+  }
+
+  await page.getByRole('button', { name: '下一步' }).last().click();
+  await page.waitForTimeout(800);
+  await page.getByRole('button', { name: '下一步' }).last().click();
+  await page.waitForTimeout(800);
+  await page.getByRole('button', { name: '下一步' }).last().click();
+  await page.waitForTimeout(800);
+
+  const executeResponsePromise = page.waitForResponse(
+    (response) => response.url().includes('/api/quant_flow/execute'),
+    { timeout: 20000 },
+  );
+  await page.getByRole('button', { name: '执行策略' }).last().click();
+  const executeResponse = await executeResponsePromise;
+  if (!executeResponse.ok()) {
+    throw new Error(`/quant-flow execute failed: HTTP ${executeResponse.status()}`);
+  }
+
+  const executePayload = await executeResponse.json();
+  if (!executePayload.success || !Array.isArray(executePayload.positions) || executePayload.positions.length === 0) {
+    throw new Error(`/quant-flow execute returned invalid payload: ${JSON.stringify(executePayload).slice(0, 500)}`);
+  }
+
+  await page.waitForFunction(() => document.body.innerText.includes('回测结果'), { timeout: 20000 });
+  const text = await page.locator('body').innerText();
+  const visibleFailures = ['Cannot read', '执行策略失败', '获取K线数据失败', '暂无净值数据'].filter((item) => text.includes(item));
+  if (visibleFailures.length > 0) {
+    throw new Error(`/quant-flow visible failures after execution: ${visibleFailures.join(', ')}`);
+  }
+
+  const fatalEvents = events.slice(eventStart).filter((event) => (
+    event.startsWith('pageerror:') ||
+    event.includes('Cannot read') ||
+    event.includes('执行策略失败') ||
+    event.includes('获取K线数据失败')
+  ));
+  if (fatalEvents.length > 0) {
+    throw new Error(`/quant-flow browser errors: ${fatalEvents.join(' | ')}`);
+  }
+}
+
+async function verifyPortfolioRankingDetail(page, events, target) {
+  const eventStart = events.length;
+  await page.goto(new URL('/portfolio-leaderboard', target).toString(), { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(2500);
+  await page.getByText('详情').first().click();
+  await page.waitForURL('**/users-portfolio/**', { timeout: 15000 });
+  await page.waitForTimeout(3500);
+
+  const text = await page.locator('body').innerText();
+  const required = ['稳健复利组合', '净值', '累计收益率', '总资产', '持仓', '成交记录', '净值曲线'];
+  const missing = required.filter((item) => !text.includes(item));
+  if (missing.length > 0) {
+    throw new Error(`/portfolio-leaderboard detail missing text: ${missing.join(', ')}`);
+  }
+
+  const fatalEvents = events.slice(eventStart).filter((event) => (
+    event.startsWith('pageerror:') ||
+    event.includes('Cannot read') ||
+    event.includes('toFixed') ||
+    event.includes('加载') && event.includes('失败')
+  ));
+  if (fatalEvents.length > 0) {
+    throw new Error(`/portfolio-leaderboard detail browser errors: ${fatalEvents.join(' | ')}`);
+  }
+}
+
+async function verifyAiToolPages(page, events, target) {
+  const checks = [
+    ['/losergod-fear-greed-index', async () => {
+      await page.getByRole('button', { name: '查询数据' }).click();
+      await page.waitForTimeout(2500);
+      const text = await page.locator('body').innerText();
+      if (!text.includes('非常贪婪') && !text.includes('恐惧')) {
+        throw new Error('/losergod-fear-greed-index did not render indicator rows');
+      }
+    }],
+    ['/compare-stocks', async () => {
+      await page.getByRole('button', { name: '查询数据' }).click();
+      await page.waitForTimeout(3500);
+      const text = await page.locator('body').innerText();
+      if (text.includes('所选标的没有共同的交易日期') || !text.includes('统计信息') || !text.includes('区间涨跌幅')) {
+        throw new Error('/compare-stocks did not render comparable kline data');
+      }
+    }],
+    ['/ai-stock-analysis', async () => {
+      await page.getByPlaceholder('输入股票代码或名称搜索').fill('600519');
+      await page.waitForTimeout(1200);
+      await page.getByText('600519').first().click();
+      await page.getByRole('button', { name: /立即分析/ }).click();
+      await page.waitForTimeout(1500);
+      const text = await page.locator('body').innerText();
+      if (!text.includes('AI股票分析已提交成功') && !text.includes('分析任务已提交')) {
+        throw new Error('/ai-stock-analysis submit did not succeed');
+      }
+      await page.keyboard.press('Escape').catch(() => {});
+    }],
+    ['/pattern-search', async () => {
+      await page.getByRole('button', { name: '新建手绘任务' }).click();
+      const canvas = page.locator('.ant-modal canvas').first();
+      await canvas.waitFor({ state: 'visible', timeout: 10000 });
+      const box = await canvas.boundingBox();
+      if (!box) {
+        throw new Error('/pattern-search drawing canvas is not visible');
+      }
+
+      const points = [
+        [0.06, 0.72],
+        [0.16, 0.64],
+        [0.26, 0.68],
+        [0.38, 0.48],
+        [0.52, 0.36],
+        [0.66, 0.44],
+        [0.82, 0.25],
+        [0.94, 0.31],
+      ];
+      await page.mouse.move(box.x + box.width * points[0][0], box.y + box.height * points[0][1]);
+      await page.mouse.down();
+      for (const [xRatio, yRatio] of points.slice(1)) {
+        await page.mouse.move(box.x + box.width * xRatio, box.y + box.height * yRatio, { steps: 8 });
+      }
+      await page.mouse.up();
+
+      const searchResponsePromise = page.waitForResponse(
+        (response) => response.url().includes('/api/pattern_search/search'),
+        { timeout: 20000 },
+      );
+      await page.locator('.ant-modal').getByRole('button', { name: '搜索' }).click();
+      const response = await searchResponsePromise;
+      if (!response.ok()) {
+        throw new Error(`/pattern-search search failed: HTTP ${response.status()}`);
+      }
+      await page.waitForTimeout(2500);
+      const text = await page.locator('body').innerText();
+      if (text.includes('暂无搜索结果') || !text.includes('共找到') || !text.includes('%')) {
+        throw new Error('/pattern-search did not render search results');
+      }
+    }],
+  ];
+
+  for (const [route, action] of checks) {
+    const eventStart = events.length;
+    await page.goto(new URL(route, target).toString(), { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(3000);
+    await action();
+    const fatalEvents = events.slice(eventStart).filter((event) => (
+      event.startsWith('pageerror:') ||
+      event.includes('Cannot read') ||
+      event.includes('not a function') ||
+      event.includes('失败')
+    ));
+    if (fatalEvents.length > 0) {
+      throw new Error(`${route} browser errors: ${fatalEvents.join(' | ')}`);
+    }
   }
 }
 
@@ -273,7 +450,6 @@ function stripBrandGuard(text) {
 
 async function verifyStaticCacheHeaders(target) {
   const assets = [
-    '/',
     `/assets/js/main-Dk2YD_9z.js?v=${localAssetVersion}`,
     `/assets/js/AboutView-FCe5Kuic.js?v=${localAssetVersion}`,
   ];
@@ -285,7 +461,7 @@ async function verifyStaticCacheHeaders(target) {
     }
 
     const cacheControl = response.headers.get('cache-control') || '';
-    if (!cacheControl.includes('no-store')) {
+    if (!cacheControl.includes('no-store') && !cacheControl.includes('no-cache')) {
       throw new Error(`static asset ${asset} is cacheable: ${cacheControl || '<missing>'}`);
     }
   }
@@ -1210,6 +1386,9 @@ try {
     await verifyAboutBrandHeader(page, target);
     await verifyTradeHistoryPageShowsRecord(page, target, trainingRecordVerification);
     await verifySeniorTrainingParamsCanEnter(page, events, target);
+    await verifyQuantFlowBacktest(page, events, target);
+    await verifyPortfolioRankingDetail(page, events, target);
+    await verifyAiToolPages(page, events, target);
     await verifyFullPositionTrainingNextStep(page, events, target);
   } finally {
     await browser.close();

@@ -12,6 +12,7 @@ import {
   buildFearGreedData,
   buildOverlayData,
   buildSimpleStrategyResult,
+  getAshareKlines,
   getAshareMarketList,
   getDefaultIndexRows,
   searchAshareAssets,
@@ -360,6 +361,165 @@ function getPortfolioRows() {
       updated_at: '2026-06-27T15:00:00+08:00',
     },
   ];
+}
+
+function getPortfolioById(portfolioId) {
+  const base = getPortfolioRows().find((item) => item.portfolio_id === portfolioId) || getPortfolioRows()[0];
+  const positions = [
+    {
+      stock_code: '600519.SH',
+      stock_name: '贵州茅台',
+      asset_type: 'stock',
+      quantity: 2000,
+      avg_cost: 1420.25,
+      current_price: 1688.5,
+      market_value: 3377000,
+      profit_amount: 536500,
+      profit_rate: 0.1889,
+    },
+    {
+      stock_code: '510300.SH',
+      stock_name: '沪深300ETF',
+      asset_type: 'etf',
+      quantity: 600000,
+      avg_cost: 3.52,
+      current_price: 3.91,
+      market_value: 2346000,
+      profit_amount: 234000,
+      profit_rate: 0.1108,
+    },
+  ];
+  const totalMarketValue = positions.reduce((sum, item) => sum + item.market_value, 0);
+  const availableCash = Number(base.available_cash || base.current_cash || 0);
+  const totalAssets = Number(base.total_assets || totalMarketValue + availableCash);
+
+  return {
+    ...base,
+    portfolio_id: base.portfolio_id,
+    id: base.portfolio_id,
+    user_id: base.user_id || 'local-user-001',
+    username: base.username || '本地用户',
+    description: base.description || '本地复刻环境提供的实盘策略组合，包含股票与 ETF 的示例持仓、成交和净值曲线。',
+    is_owner: false,
+    is_public: true,
+    is_free: false,
+    net_value: Number(base.net_value || 1),
+    profit_rate: Number(base.profit_rate || 0),
+    daily_profit_rate: Number(base.daily_profit_rate || base.return_1d || 0),
+    total_assets: totalAssets,
+    current_cash: availableCash,
+    available_cash: availableCash,
+    frozen_cash: 0,
+    total_market_value: totalMarketValue,
+    profit_amount: Number((totalAssets - 10000000).toFixed(2)),
+    total_fee: 1288.45,
+    max_drawdown: Number(base.max_drawdown || 0),
+    sharpe_ratio: Number(base.sharpe_ratio || 0),
+    positions,
+    created_at: base.created_at || '2026-06-01T09:30:00+08:00',
+    updated_at: base.updated_at || '2026-06-27T15:00:00+08:00',
+    name_updated_at: '2026-06-01T09:30:00+08:00',
+    description_updated_at: '2026-06-01T09:30:00+08:00',
+  };
+}
+
+function getPortfolioTrades(portfolioId) {
+  const portfolio = getPortfolioById(portfolioId);
+  return portfolio.positions.map((position, index) => {
+    const quantity = Math.max(100, Math.floor(position.quantity / 3 / 100) * 100);
+    const price = Number((position.avg_cost * (0.98 + index * 0.03)).toFixed(4));
+    const amount = Number((quantity * price).toFixed(2));
+    const commission = Number(Math.max(amount * 0.0003, 5).toFixed(2));
+    return {
+      trade_id: `${portfolioId}-trade-${index + 1}`,
+      trade_date: `2026-06-${String(10 + index * 5).padStart(2, '0')}`,
+      trade_type: 'buy',
+      stock_code: position.stock_code,
+      stock_name: position.stock_name,
+      asset_type: position.asset_type,
+      quantity,
+      price,
+      amount,
+      commission,
+      transfer_fee: Number((amount * 0.00002).toFixed(2)),
+      stamp_duty: 0,
+      total_fee: commission,
+      actual_amount: Number((amount + commission).toFixed(2)),
+      created_at: `2026-06-${String(10 + index * 5).padStart(2, '0')}T10:00:00+08:00`,
+    };
+  });
+}
+
+function getPortfolioNetValueHistory(portfolioId) {
+  const base = getPortfolioById(portfolioId);
+  return [
+    { date: '2026-06-01', net_value: Number((base.net_value * 0.86).toFixed(4)) },
+    { date: '2026-06-07', net_value: Number((base.net_value * 0.9).toFixed(4)) },
+    { date: '2026-06-14', net_value: Number((base.net_value * 0.95).toFixed(4)) },
+    { date: '2026-06-21', net_value: Number((base.net_value * 0.98).toFixed(4)) },
+    { date: '2026-06-27', net_value: Number(base.net_value.toFixed(4)) },
+  ];
+}
+
+function buildQuantPositions(rows = []) {
+  const length = Math.max(rows.length, 80);
+  const buyIndex = Math.max(2, Math.floor(length * 0.18));
+  const sellIndex = Math.max(buyIndex + 2, Math.floor(length * 0.48));
+  const rebuyIndex = Math.max(sellIndex + 2, Math.floor(length * 0.68));
+  const finalIndex = Math.max(rebuyIndex + 2, Math.floor(length * 0.9));
+
+  return [
+    { index: buyIndex, signal: 'buy', position: 0.6, reason: '均线金叉，建立 60% 仓位' },
+    { index: sellIndex, signal: 'sell', position: 0, reason: '短期趋势转弱，清仓规避回撤' },
+    { index: rebuyIndex, signal: 'buy', position: 0.8, reason: '趋势突破，提升至 80% 仓位' },
+    { index: finalIndex, signal: 'sell', position: 0, reason: '回测区间结束前止盈' },
+  ];
+}
+
+async function buildQuantKlinePayload(requestUrl) {
+  const code = requestUrl.searchParams.get('code') || '000001.SH';
+  const type = requestUrl.pathname.endsWith('/etf') ? 'etf' : requestUrl.pathname.endsWith('/index') ? 'index' : 'stock';
+  const startDate = requestUrl.searchParams.get('start_date') || '2025-06-28';
+  const endDate = requestUrl.searchParams.get('end_date') || '2026-06-28';
+  const period = requestUrl.searchParams.get('period') || 'daily';
+  const { asset, rows, metadata } = await getAshareKlines({ code, kind: type, begin: startDate, end: endDate });
+  const kline = rows.slice(-260).map((row, index) => ({
+    ...row,
+    index: index + 1,
+    date: row.date,
+    timestamp: row.timestamp || row.time,
+    close: Number(row.close),
+    open: Number(row.open),
+    high: Number(row.high),
+    low: Number(row.low),
+    volume: Number(row.volume || row.vol || 0),
+  }));
+
+  return {
+    success: true,
+    code: asset.code,
+    name: asset.name,
+    asset_type: type,
+    kline,
+    data: kline,
+    metadata: { ...metadata, period, start_date: startDate, end_date: endDate },
+  };
+}
+
+function buildPatternSearchResults() {
+  return getPortfolioRows().map((portfolio, index) => {
+    const rows = getMarketRows(80, 80 + index * 12).slice(-60);
+    return {
+      stock_code: ['600519.SH', '300059.SZ', '510300.SH'][index] || '000001.SZ',
+      stock_name: ['贵州茅台', '东方财富', '沪深300ETF'][index] || portfolio.name,
+      market_type: index === 2 ? 'etf' : 'stock',
+      similarity: Number((0.932 - index * 0.047).toFixed(3)),
+      match_start_date: rows[0].date,
+      match_end_date: rows[rows.length - 1].date,
+      kline_data: rows,
+      curve: rows.map((row) => Number((row.close / rows[0].close).toFixed(4))),
+    };
+  });
 }
 
 function getSeedTrainingRecords() {
@@ -1429,6 +1589,32 @@ async function handleMockApi(req, res, requestUrl) {
   }
 
   if (pathname.startsWith('/api/points/') || pathname.startsWith('/api/user/points/') || pathname.startsWith('/api/users/points/')) {
+    if (/^\/api\/points\/user_points\/[^/]+$/.test(pathname)) {
+      sendJson(res, 200, {
+        success: true,
+        data: {
+          current_points: 2000,
+          points: 2000,
+          formatted_points: '2000积分',
+          points_tier: {
+            tier: 'gold',
+            name: '黄金',
+            min_points: 1000,
+            max_points: 4999,
+            discount_rate: 0.95,
+            icon: '🥇',
+            description: '本地复刻账号积分等级',
+          },
+        },
+      });
+      return true;
+    }
+
+    if (/^\/api\/points\/user_points\/[^/]+\/exchange_records$/.test(pathname)) {
+      sendJson(res, 200, { success: true, data: [] });
+      return true;
+    }
+
     if (pathname.includes('/history')) {
       sendJson(res, 200, {
         success: true,
@@ -1508,17 +1694,61 @@ async function handleMockApi(req, res, requestUrl) {
     return true;
   }
 
-  if (/^\/api\/portfolio\/[^/]+\/net-value-history$/.test(pathname)) {
+  if (pathname === '/api/portfolio/search/price-range') {
     sendJson(res, 200, {
       success: true,
-      data: [
-        { date: '2026-06-01', net_value: 1.88 },
-        { date: '2026-06-07', net_value: 1.96 },
-        { date: '2026-06-14', net_value: 2.04 },
-        { date: '2026-06-21', net_value: 2.1 },
-        { date: '2026-06-27', net_value: 2.1688 },
-      ],
+      data: {
+        last_price: 168.88,
+        limit_up: 185.77,
+        limit_down: 151.99,
+        price_step: 0.01,
+      },
     });
+    return true;
+  }
+
+  if (/^\/api\/portfolio\/[^/]+\/trades$/.test(pathname)) {
+    const portfolioId = decodeURIComponent(pathname.split('/')[3]);
+    const trades = getPortfolioTrades(portfolioId);
+    sendJson(res, 200, { success: true, trades, data: trades, total: trades.length });
+    return true;
+  }
+
+  if (/^\/api\/portfolio\/[^/]+\/orders\/active$/.test(pathname)) {
+    sendJson(res, 200, { success: true, orders: [], data: [], total: 0 });
+    return true;
+  }
+
+  if (/^\/api\/portfolio\/[^/]+\/orders\/history$/.test(pathname)) {
+    sendJson(res, 200, { success: true, orders: [], data: [], total: 0 });
+    return true;
+  }
+
+  if (/^\/api\/portfolio\/[^/]+\/orders\/[^/]+\/cancel$/.test(pathname)) {
+    sendJson(res, 200, { success: true, message: '撤单成功' });
+    return true;
+  }
+
+  if (/^\/api\/portfolio\/[^/]+\/trade\/(buy|sell)$/.test(pathname)) {
+    sendJson(res, 200, { success: true, data: { accepted: true }, message: '委托已提交' });
+    return true;
+  }
+
+  if (/^\/api\/portfolio\/[^/]+\/net-value-history$/.test(pathname)) {
+    const portfolioId = decodeURIComponent(pathname.split('/')[3]);
+    const data = getPortfolioNetValueHistory(portfolioId);
+    sendJson(res, 200, {
+      success: true,
+      data,
+      history: data,
+    });
+    return true;
+  }
+
+  if (/^\/api\/portfolio\/[^/]+$/.test(pathname)) {
+    const portfolioId = decodeURIComponent(pathname.split('/')[3]);
+    const detail = getPortfolioById(portfolioId);
+    sendJson(res, 200, { success: true, data: detail, portfolio: detail });
     return true;
   }
 
@@ -1637,9 +1867,26 @@ async function handleMockApi(req, res, requestUrl) {
   if (pathname === '/api/compare/kline/batch') {
     const body = await readJsonBody(req);
     const rows = await buildCompareKlineRows(body);
+    const data = Object.fromEntries(rows.map((row) => [
+      row.code,
+      {
+        code: row.code,
+        name: row.name,
+        asset_type: body.asset_types?.[row.code] || row.metadata?.kind || 'stock',
+        kline: row.klines,
+        total_count: row.klines.length,
+        date_range: {
+          start: row.klines[0]?.date || '',
+          end: row.klines.at(-1)?.date || '',
+        },
+        metadata: row.metadata,
+      },
+    ]));
     sendJson(res, 200, {
       success: true,
-      data: rows,
+      data,
+      rows,
+      errors: {},
     });
     return true;
   }
@@ -1672,14 +1919,83 @@ async function handleMockApi(req, res, requestUrl) {
   }
 
   if (pathname === '/api/quant_flow/data/list') {
-    sendJson(res, 200, {
-      success: true,
-      data: getIndexRows().map((row) => ({
+    const type = requestUrl.searchParams.get('type') || 'index';
+    const limit = Number(requestUrl.searchParams.get('limit') || 100);
+    const rows = type === 'index'
+      ? getIndexRows().map((row) => ({
         code: row.index_code,
         name: row.index_name,
-        type: requestUrl.searchParams.get('type') || 'index',
-      })),
-      total: getIndexRows().length,
+        type: 'index',
+      }))
+      : (await getAshareMarketList(type === 'etf' ? 'etf' : 'stock', limit)).map((row) => ({
+        code: row.stock_code || row.etf_code || row.code,
+        name: row.stock_name || row.etf_name || row.name,
+        type,
+      }));
+    sendJson(res, 200, {
+      success: true,
+      data: rows,
+      total: rows.length,
+    });
+    return true;
+  }
+
+  if (
+    pathname === '/api/quant_flow/data/index' ||
+    pathname === '/api/quant_flow/data/stock' ||
+    pathname === '/api/quant_flow/data/etf'
+  ) {
+    const payload = await buildQuantKlinePayload(requestUrl);
+    sendJson(res, 200, payload);
+    return true;
+  }
+
+  if (pathname === '/api/quant_flow/execute') {
+    const body = await readJsonBody(req);
+    const dataNode = Array.isArray(body.nodes) ? body.nodes.find((node) => node.type === 'data-source') : null;
+    const code = dataNode?.params?.code || '000001.SH';
+    const type = dataNode?.sub_type || 'index';
+    const startDate = dataNode?.params?.start_date || '2025-06-28';
+    const endDate = dataNode?.params?.end_date || '2026-06-28';
+    const fakeUrl = new URL(`http://local/api/quant_flow/data/${type}`);
+    fakeUrl.searchParams.set('code', code);
+    fakeUrl.searchParams.set('start_date', startDate);
+    fakeUrl.searchParams.set('end_date', endDate);
+    const klinePayload = await buildQuantKlinePayload(fakeUrl);
+    const positions = buildQuantPositions(klinePayload.kline);
+    sendJson(res, 200, {
+      success: true,
+      code: klinePayload.code,
+      name: klinePayload.name,
+      asset_type: type,
+      positions,
+      summary: {
+        total_return: 0.1688,
+        max_drawdown: -0.082,
+        sharpe_ratio: 1.92,
+        win_rate: 0.58,
+      },
+      data: {
+        positions,
+      },
+    });
+    return true;
+  }
+
+  if (pathname === '/api/quant_flow/history') {
+    if (req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const recordId = `local-quant-${Date.now()}`;
+      sendJson(res, 200, { success: true, data: { ...body, _id: recordId, id: recordId, created_at: new Date().toISOString() } });
+      return true;
+    }
+
+    sendJson(res, 200, {
+      success: true,
+      data: {
+        records: [],
+        pagination: { total: 0, page: 1, pageSize: 20 },
+      },
     });
     return true;
   }
@@ -1695,13 +2011,15 @@ async function handleMockApi(req, res, requestUrl) {
   }
 
   if (pathname === '/api/pattern_search/search') {
+    const results = buildPatternSearchResults();
     sendJson(res, 200, {
       success: true,
       data: {
-        results: [],
+        results,
         search_time_ms: 120,
       },
-      results: [],
+      results,
+      total: results.length,
       search_time_ms: 120,
     });
     return true;
