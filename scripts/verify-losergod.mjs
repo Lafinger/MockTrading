@@ -11,7 +11,7 @@ const rootDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const publicDir = path.join(rootDir, 'public');
 const chromePath = process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const localAssetVersion = 'lafinger-local-v6';
-const requestedPort = Number(process.env.PORT || 5173);
+const requestedPort = Number(process.env.PORT || 9527);
 const port = await findFreePort(requestedPort);
 const target = `http://127.0.0.1:${port}/`;
 
