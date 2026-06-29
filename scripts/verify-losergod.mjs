@@ -216,14 +216,32 @@ async function verifyAiToolPages(page, events, target) {
       }
     }],
     ['/ai-stock-analysis', async () => {
-      await page.getByPlaceholder('输入股票代码或名称搜索').fill('600519');
+      await page.getByPlaceholder('输入股票代码或名称搜索').fill('002353');
       await page.waitForTimeout(1200);
-      await page.getByText('600519').first().click();
+      await page.getByText('002353').first().click();
+      await page.getByText('5级-全景解析').first().click();
       await page.getByRole('button', { name: /立即分析/ }).click();
       await page.waitForTimeout(1500);
       const text = await page.locator('body').innerText();
       if (!text.includes('AI股票分析已提交成功') && !text.includes('分析任务已提交')) {
         throw new Error('/ai-stock-analysis submit did not succeed');
+      }
+      if (!text.includes('杰瑞股份') || !text.includes('5级-全景解析') || !text.includes('100 积分')) {
+        throw new Error('/ai-stock-analysis level 5 submit modal missing expected text');
+      }
+      await page.getByRole('button', { name: '查看历史记录' }).click();
+      await page.waitForTimeout(2500);
+      const historyText = await page.locator('body').innerText();
+      if (!historyText.includes('杰瑞股份') || !historyText.includes('5级-全景解析') || !historyText.includes('买入')) {
+        throw new Error('/ai-stock-analysis history did not show level 5 Jereh record');
+      }
+      await page.locator('.view-detail-btn').first().click();
+      await page.waitForTimeout(2500);
+      const detailText = await page.locator('body').innerText();
+      const requiredDetailText = ['杰瑞股份', '基础分析', '多空辩论', '研究经理投资计划', '风险经理最终决策'];
+      const missingDetailText = requiredDetailText.filter((item) => !detailText.includes(item));
+      if (missingDetailText.length > 0) {
+        throw new Error(`/ai-stock-analysis detail missing text: ${missingDetailText.join(', ')}`);
       }
       await page.keyboard.press('Escape').catch(() => {});
     }],
@@ -844,6 +862,159 @@ async function verifyFearGreedIndexPayload(target, requestPayload) {
   }
 }
 
+async function verifyAiPanoramaAnalysisApi(target, accounts) {
+  const phone = accounts.primary.phone;
+
+  const depthsResponse = await fetch(new URL('/api/ai-stock-analysis/depths', target));
+  if (!depthsResponse.ok) {
+    throw new Error(`/api/ai-stock-analysis/depths failed: HTTP ${depthsResponse.status}`);
+  }
+  const depthsPayload = await depthsResponse.json();
+  const panoramaDepth = depthsPayload.data?.find((depth) => depth.level === 5);
+  if (!depthsPayload.success || !panoramaDepth || panoramaDepth.name !== '5级-全景解析' || panoramaDepth.points_cost !== 100) {
+    throw new Error(`AI panorama depth missing or invalid: ${JSON.stringify(depthsPayload)}`);
+  }
+
+  const analyzeResponse = await fetch(new URL('/api/ai-stock-analysis/analyze', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ symbol: '002353.SZ', phone, analysis_depth: 5 }),
+  });
+  if (!analyzeResponse.ok) {
+    throw new Error(`/api/ai-stock-analysis/analyze level 5 failed: HTTP ${analyzeResponse.status}`);
+  }
+  const analyzePayload = await analyzeResponse.json();
+  const taskId = analyzePayload.data?.task_id;
+  if (!analyzePayload.success || !taskId || analyzePayload.data?.remaining_points !== 1900) {
+    throw new Error(`AI panorama analyze response invalid: ${JSON.stringify(analyzePayload)}`);
+  }
+
+  const historyResponse = await fetch(new URL(`/api/ai-stock-analysis/history?phone=${encodeURIComponent(phone)}&page=1&page_size=10`, target));
+  if (!historyResponse.ok) {
+    throw new Error(`/api/ai-stock-analysis/history failed: HTTP ${historyResponse.status}`);
+  }
+  const historyPayload = await historyResponse.json();
+  const record = historyPayload.data?.records?.find((item) => item.task_id === taskId);
+  if (
+    !historyPayload.success ||
+    !record ||
+    record.stock_code !== '002353.SZ' ||
+    record.stock_name !== '杰瑞股份' ||
+    record.depth_label !== '5级-全景解析' ||
+    record.status !== 'completed' ||
+    record.recommendation !== '买入' ||
+    !record.current_price ||
+    !record.target_price ||
+    !record.stop_loss ||
+    !record.take_profit
+  ) {
+    throw new Error(`AI panorama history record invalid: ${JSON.stringify({ historyPayload, taskId })}`);
+  }
+
+  const resultResponse = await fetch(new URL(`/api/ai-stock-analysis/result/${encodeURIComponent(taskId)}`, target));
+  if (!resultResponse.ok) {
+    throw new Error(`/api/ai-stock-analysis/result/${taskId} failed: HTTP ${resultResponse.status}`);
+  }
+  const resultPayload = await resultResponse.json();
+  const report = resultPayload.data?.analysis_result?.detailed_report || '';
+  const requiredReportText = ['基础分析', '多空辩论', '研究经理投资计划', '风险经理最终决策', '免责声明'];
+  const missingReportText = requiredReportText.filter((text) => !report.includes(text));
+  if (
+    !resultPayload.success ||
+    resultPayload.data?.stock_code !== '002353.SZ' ||
+    resultPayload.data?.analysis_result?.recommendation !== '买入' ||
+    missingReportText.length > 0
+  ) {
+    throw new Error(`AI panorama result invalid: ${JSON.stringify({
+      stock_code: resultPayload.data?.stock_code,
+      recommendation: resultPayload.data?.analysis_result?.recommendation,
+      missingReportText,
+    })}`);
+  }
+
+  for (const format of ['markdown', 'word', 'pdf']) {
+    const exportResponse = await fetch(new URL(`/api/ai-stock-analysis/export/${encodeURIComponent(taskId)}/${format}`, target));
+    const body = await exportResponse.text();
+    if (!exportResponse.ok || !body.includes('杰瑞股份') || !body.includes('全景解析报告')) {
+      throw new Error(`AI panorama ${format} export invalid: HTTP ${exportResponse.status}, length=${body.length}`);
+    }
+  }
+
+  const markResponse = await fetch(new URL(`/api/ai-stock-analysis/mark-read/${encodeURIComponent(taskId)}`, target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ phone }),
+  });
+  if (!markResponse.ok) {
+    throw new Error(`/api/ai-stock-analysis/mark-read/${taskId} failed: HTTP ${markResponse.status}`);
+  }
+
+  const markedHistoryResponse = await fetch(new URL(`/api/ai-stock-analysis/history?phone=${encodeURIComponent(phone)}&page=1&page_size=10`, target));
+  const markedHistoryPayload = await markedHistoryResponse.json();
+  const markedRecord = markedHistoryPayload.data?.records?.find((item) => item.task_id === taskId);
+  if (!markedRecord?.is_read) {
+    throw new Error(`AI panorama mark-read did not persist: ${JSON.stringify(markedRecord)}`);
+  }
+
+  const nonSampleResponse = await fetch(new URL('/api/ai-stock-analysis/analyze', target), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ symbol: '002851.SZ', phone, analysis_depth: 5 }),
+  });
+  if (!nonSampleResponse.ok) {
+    throw new Error(`AI panorama non-sample analyze should not fail when CPA key is missing: HTTP ${nonSampleResponse.status}`);
+  }
+  const nonSamplePayload = await nonSampleResponse.json();
+  const nonSampleTaskId = nonSamplePayload.data?.task_id;
+  if (!nonSamplePayload.success || !nonSampleTaskId) {
+    throw new Error(`AI panorama non-sample analyze response invalid: ${JSON.stringify(nonSamplePayload)}`);
+  }
+  const nonSampleResultResponse = await fetch(new URL(`/api/ai-stock-analysis/result/${encodeURIComponent(nonSampleTaskId)}`, target));
+  const nonSampleResultPayload = await nonSampleResultResponse.json();
+  const nonSampleReport = nonSampleResultPayload.data?.analysis_result?.detailed_report || '';
+  const nonSampleSummary = nonSampleResultPayload.data?.analysis_result || {};
+  if (
+    !nonSampleResultPayload.success ||
+    nonSampleResultPayload.data?.stock_name !== '麦格米特' ||
+    !nonSampleReport.includes('基础分析') ||
+    !nonSampleReport.includes('风险经理最终决策') ||
+    nonSampleReport.length < 12000 ||
+    [
+      '均线',
+      'MACD',
+      '布林',
+      'RSI',
+      '成交量',
+      '阻力',
+      '估值',
+      '营收',
+      '净利润',
+      '现金流',
+      '毛利率',
+      'ROE',
+      '负债率',
+      '市场共识',
+      '催化剂',
+      '目标价',
+      '止损位',
+      '止盈位',
+    ].some((term) => !nonSampleReport.includes(term)) ||
+    nonSampleResultPayload.data?.current_price === 100 ||
+    nonSampleSummary.target_price === 112 ||
+    nonSampleSummary.stop_loss === 92 ||
+    nonSampleSummary.take_profit === 118
+  ) {
+    throw new Error(`AI panorama non-sample fallback report invalid: ${JSON.stringify({
+      stock_name: nonSampleResultPayload.data?.stock_name,
+      reportLength: nonSampleReport.length,
+      current_price: nonSampleResultPayload.data?.current_price,
+      target_price: nonSampleSummary.target_price,
+      stop_loss: nonSampleSummary.stop_loss,
+      take_profit: nonSampleSummary.take_profit,
+    })}`);
+  }
+}
+
 function buildVerificationKlines(count = 40) {
   return Array.from({ length: count }, (_, index) => {
     const close = Number((10 + index * 0.08 + Math.sin(index / 4) * 0.2).toFixed(4));
@@ -1302,6 +1473,7 @@ try {
   await verifyStrategySignalsApi(target);
   await verifyFearGreedIndexApi(target);
   const accounts = await verifyAuthAccounts(target);
+  await verifyAiPanoramaAnalysisApi(target, accounts);
   const trainingRecordVerification = await verifyTrainingRecordPersistence(target, accounts);
 
   const browser = await chromium.launch({ executablePath: chromePath, headless: true });

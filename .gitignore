@@ -3,4 +3,5 @@ public/
 .losergod-cache/
 losergod-local-*.png
 *.log
+.env.local
 

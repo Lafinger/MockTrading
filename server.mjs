@@ -17,6 +17,10 @@ import {
   getDefaultIndexRows,
   searchAshareAssets,
 } from './src/ashare-data.mjs';
+import {
+  handleAiStockAnalysisApi,
+  initAiStockAnalysisStore,
+} from './src/ai-stock-analysis.mjs';
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(rootDir, 'public');
@@ -71,6 +75,7 @@ localDb.exec(`
     updated_at TEXT NOT NULL
   );
 `);
+initAiStockAnalysisStore(localDb);
 
 const mimeTypes = new Map([
   ['.html', 'text/html; charset=utf-8'],
@@ -2050,73 +2055,11 @@ async function handleMockApi(req, res, requestUrl) {
   }
 
   if (pathname.startsWith('/api/ai-stock-analysis')) {
-    const subPath = pathname.slice('/api/ai-stock-analysis'.length) || '/';
-
-    if (subPath === '/depths') {
-      sendJson(res, 200, { success: true, data: getAiDepths() });
-      return true;
-    }
-
-    if (subPath === '/points') {
-      sendJson(res, 200, { success: true, data: { points: 2000 }, points: 2000 });
-      return true;
-    }
-
-    if (subPath === '/history') {
-      sendJson(res, 200, {
-        success: true,
-        data: {
-          records: [
-            {
-              task_id: 'LOCAL-AI-001',
-              stock_code: '600519.SH',
-              symbol: '600519.SH',
-              stock_name: '贵州茅台',
-              recommendation: '持有',
-              position: '30%',
-              current_price: 1688.5,
-              target_price: 1780,
-              stop_loss: 1580,
-              take_profit: 1800,
-              depth_label: '标准分析',
-              status: 'completed',
-              is_read: false,
-              created_at: '2026-06-27T09:30:00+08:00',
-            },
-          ],
-          total: 1,
-        },
-      });
-      return true;
-    }
-
-    if (subPath === '/analyze') {
-      sendJson(res, 200, {
-        success: true,
-        data: { task_id: `LOCAL-AI-${Date.now()}`, remaining_points: 1900 },
-        message: '分析任务已提交',
-      });
-      return true;
-    }
-
-    if (subPath.startsWith('/result/')) {
-      sendJson(res, 200, {
-        success: true,
-        data: {
-          task_id: subPath.split('/').pop(),
-          stock_code: '600519.SH',
-          stock_name: '贵州茅台',
-          recommendation: '持有',
-          summary: '本地复刻环境提供的模拟 AI 分析报告。',
-        },
-      });
-      return true;
-    }
-
-    if (subPath.startsWith('/mark-read/') || subPath === '/mark-all-read') {
-      sendJson(res, 200, { success: true, data: { count: 1 } });
-      return true;
-    }
+    return handleAiStockAnalysisApi(req, res, requestUrl, {
+      db: localDb,
+      sendJson,
+      readJsonBody,
+    });
   }
 
   if (pathname.startsWith('/api/virtual_exchange')) {
