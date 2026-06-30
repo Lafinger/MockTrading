@@ -462,6 +462,29 @@ async function verifyBrandAssets() {
   }
 }
 
+async function verifyKlineMainMaColorCustomizationAssets() {
+  const klineSettings = await fs.readFile(path.join(publicDir, 'assets/js/klineUserSettings-DB_uUH_W.js'), 'utf8');
+  if (!klineSettings.includes('maColors')) {
+    throw new Error('kline user settings do not persist MA colors');
+  }
+
+  const assetNames = await fs.readdir(path.join(publicDir, 'assets/js'));
+  const klineChartBundles = assetNames.filter((name) => /^KLineChart-.+\.js$/.test(name));
+  if (klineChartBundles.length === 0) {
+    throw new Error('no KLineChart bundles found for MA color customization verification');
+  }
+
+  for (const bundleName of klineChartBundles) {
+    const bundle = await fs.readFile(path.join(publicDir, 'assets/js', bundleName), 'utf8');
+    if (!bundle.includes('type:"color"')) {
+      throw new Error(`${bundleName} does not expose MA color inputs`);
+    }
+    if (!bundle.includes('maColors')) {
+      throw new Error(`${bundleName} does not apply saved MA colors`);
+    }
+  }
+}
+
 function stripBrandGuard(text) {
   return text.replace(/<script id="lafinger-brand-guard">[\s\S]*?<\/script>/, '');
 }
@@ -1466,6 +1489,7 @@ const server = spawn(process.execPath, ['server.mjs'], {
 try {
   await waitForServer(server);
   await verifyBrandAssets();
+  await verifyKlineMainMaColorCustomizationAssets();
   await verifyStaticCacheHeaders(target);
   await verifyLanAccess(port);
   await verifyRealAshareData(target);
